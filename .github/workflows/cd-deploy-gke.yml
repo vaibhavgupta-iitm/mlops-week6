@@ -141,7 +141,7 @@ jobs:
         cat image-metadata.json
     
     - name: Upload image metadata
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: image-metadata
         path: image-metadata.json
