@@ -13,6 +13,7 @@ from src.model_training import ModelTrainer
 from src.dvc_operations import DVCOperations
 
 from mlflow.models import infer_signature
+import mlflow
 
 import pandas as pd
 
@@ -147,6 +148,9 @@ def main():
                 args.use_mlflow_model = False
         
         # Train new model if not loaded from registry
+        model_version = None
+        current_run_id = None
+        
         if not args.use_mlflow_model:
             if args.hyperparameter_tuning:
                 logger.info("Training model with hyperparameter tuning...")
@@ -157,21 +161,54 @@ def main():
                 logger.info("Training model with single hyperparameter set...")
                 model = model_trainer.train_model(X_train, y_train)
             
+            # Get the current run ID and model version
+            active_run = mlflow.active_run()
+            if active_run:
+                current_run_id = active_run.info.run_id
+                logger.info(f"Current run ID: {current_run_id}")
+            
             # Evaluate model
             logger.info("Evaluating model...")
             metrics = model_trainer.evaluate_model(X_test, y_test, log_to_mlflow=True)
             
+            # Get the model version that was just registered
+            if current_run_id:
+                from mlflow.tracking import MlflowClient
+                import time
+                
+                client = MlflowClient()
+                
+                # Wait a bit for registration to complete
+                time.sleep(3)
+                
+                # Find the version for this run
+                model_versions = client.search_model_versions(f"name='iris-classifier'")
+                for mv in model_versions:
+                    if mv.run_id == current_run_id:
+                        model_version = int(mv.version)
+                        logger.info(f"Model registered as version {model_version}")
+                        break
+            
             # Promote to production if requested
             if args.promote_to_production:
                 logger.info("Promoting model to Production stage...")
-                best_run_id = model_trainer.get_best_model_from_experiment(
-                    experiment_name=args.mlflow_experiment_name,
-                    metric="test_accuracy"
-                )
-                model_trainer.promote_model_to_production(
-                    model_name="iris-classifier",
-                    run_id=best_run_id
-                )
+                
+                if model_version:
+                    # Use the version we just captured
+                    model_trainer.promote_model_to_production(
+                        model_name="iris-classifier",
+                        version=model_version
+                    )
+                else:
+                    # Fallback to the old approach with run_id
+                    best_run_id = model_trainer.get_best_model_from_experiment(
+                        experiment_name=args.mlflow_experiment_name,
+                        metric="test_accuracy"
+                    )
+                    model_trainer.promote_model_to_production(
+                        model_name="iris-classifier",
+                        run_id=best_run_id
+                    )
         
         # Save metrics to file
         logger.info("Saving metrics...")
