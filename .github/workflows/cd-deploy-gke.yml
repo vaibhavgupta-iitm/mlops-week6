@@ -29,7 +29,7 @@ env:
   GCP_REGION: us-central1
   DEPLOYMENT_NAME: iris-api
   IMAGE_NAME: iris-classifier
-  REPOSITORY: iris-api  # Artifact Registry repository name
+  REPOSITORY: iris-api
 
 jobs:
   build-and-push:
@@ -37,9 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     
     outputs:
-      image_tag: ${{ steps.sanitize_tag.outputs.safe_tag }}
+      image_tag: ${{ steps.image_info.outputs.image_tag }}
       image_url: ${{ steps.image_info.outputs.image_url }}
-      full_image: ${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}
+      full_image: ${{ steps.image_info.outputs.full_image }}
     
     steps:
     - name: Checkout code
@@ -68,34 +68,32 @@ jobs:
           --description="IRIS API Docker images" \
           --project=${{ env.PROJECT_ID }} || echo "Repository already exists"
     
-    - name: Generate image tag
+    - name: Generate image tag and build full image reference
       id: image_info
       run: |
         SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
-        IMAGE_TAG="${{ github.ref_name }}-${SHORT_SHA}-$(date +%s)"
+        IMAGE_TAG=$(echo "${{ github.ref_name }}-${SHORT_SHA}-$(date +%s)" | tr '/' '-')
         IMAGE_URL="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}"
+        FULL_IMAGE="${IMAGE_URL}:${IMAGE_TAG}"
         
         echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
         echo "image_url=${IMAGE_URL}" >> $GITHUB_OUTPUT
+        echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
         
-        echo "📦 Base Image URL: ${IMAGE_URL}"
+        echo "📦 Image URL: ${IMAGE_URL}"
         echo "📦 Image Tag: ${IMAGE_TAG}"
-
-    - name: Sanitize Docker tag
-      id: sanitize_tag
-      run: |
-        SAFE_TAG=$(echo "${{ steps.image_info.outputs.image_tag }}" | tr '/' '-')
-        echo "safe_tag=${SAFE_TAG}" >> $GITHUB_OUTPUT
-        echo "📦 Sanitized Tag: ${SAFE_TAG}"
+        echo "📦 Full Image: ${FULL_IMAGE}"
     
     - name: Build Docker image
       run: |
-        FULL_IMAGE="${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
+        FULL_IMAGE="${{ steps.image_info.outputs.full_image }}"
+        IMAGE_URL="${{ steps.image_info.outputs.image_url }}"
+        
         echo "Building image: ${FULL_IMAGE}"
         
         docker build \
           -t ${FULL_IMAGE} \
-          -t ${{ steps.image_info.outputs.image_url }}:latest \
+          -t ${IMAGE_URL}:latest \
           --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
           --build-arg VCS_REF=${{ github.sha }} \
           --label "org.opencontainers.image.source=${{ github.repositoryUrl }}" \
@@ -108,25 +106,17 @@ jobs:
     - name: Test Docker image
       run: |
         echo "🧪 Testing Docker image..."
-        IMAGE="${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
+        IMAGE="${{ steps.image_info.outputs.full_image }}"
         echo "Testing image: ${IMAGE}"
         
-        # Run container in background
         docker run -d --name test-container -p 8080:8080 ${IMAGE}
-        
-        # Wait for container to start
         sleep 15
         
-        # Check logs for debugging
         docker logs test-container
         
-        # Test health endpoint
         curl -f http://localhost:8080/health || (echo "❌ Health check failed" && docker logs test-container && exit 1)
-        
-        # Test root endpoint
         curl -f http://localhost:8080/ || (echo "❌ Root endpoint failed" && docker logs test-container && exit 1)
         
-        # Stop container
         docker stop test-container
         docker rm test-container
         
@@ -134,24 +124,24 @@ jobs:
     
     - name: Push Docker image to Artifact Registry
       run: |
-        FULL_IMAGE="${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
+        FULL_IMAGE="${{ steps.image_info.outputs.full_image }}"
+        IMAGE_URL="${{ steps.image_info.outputs.image_url }}"
+        
         echo "Pushing image: ${FULL_IMAGE}"
         
         docker push ${FULL_IMAGE}
-        docker push ${{ steps.image_info.outputs.image_url }}:latest
+        docker push ${IMAGE_URL}:latest
         
         echo "✓ Image pushed to Artifact Registry"
         echo "📦 Full Image: ${FULL_IMAGE}"
     
     - name: Generate image metadata
       run: |
-        FULL_IMAGE="${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
-        
         cat > image-metadata.json << EOF
         {
             "image_url": "${{ steps.image_info.outputs.image_url }}",
-            "image_tag": "${{ steps.sanitize_tag.outputs.safe_tag }}",
-            "full_image": "${FULL_IMAGE}",
+            "image_tag": "${{ steps.image_info.outputs.image_tag }}",
+            "full_image": "${{ steps.image_info.outputs.full_image }}",
             "commit_sha": "${{ github.sha }}",
             "build_time": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
             "branch": "${{ github.ref_name }}"
@@ -197,7 +187,6 @@ jobs:
     
     - name: Create GKE cluster (if not exists)
       run: |
-        # Check if cluster exists
         if ! gcloud container clusters describe ${{ env.GKE_CLUSTER }} \
           --zone=${{ env.GKE_ZONE }} \
           --project=${{ env.PROJECT_ID }} 2>/dev/null; then
@@ -253,7 +242,6 @@ jobs:
       run: |
         echo "🚀 Deploying to Kubernetes..."
         
-        # Apply Kubernetes manifests
         kubectl apply -f kubernetes/deployment.yaml
         kubectl apply -f kubernetes/service.yaml
         kubectl apply -f kubernetes/hpa.yaml
@@ -281,7 +269,6 @@ jobs:
         echo "🌐 Service:"
         kubectl get service iris-api-service
         
-        # Get external IP (may take a few minutes)
         echo "⏳ Waiting for external IP..."
         sleep 30
         
@@ -306,11 +293,8 @@ jobs:
         fi
         
         echo "🧪 Testing deployed API at: http://${EXTERNAL_IP}"
-        
-        # Wait for the load balancer
         sleep 30
         
-        # Test health endpoint with retry
         for i in {1..10}; do
           if curl -f http://${EXTERNAL_IP}/health; then
             echo "✓ Health check passed"
@@ -321,7 +305,6 @@ jobs:
           fi
         done
         
-        # Test prediction endpoint
         echo "Testing prediction endpoint..."
         curl -X POST "http://${EXTERNAL_IP}/predict" \
           -H "Content-Type: application/json" \
@@ -427,7 +410,6 @@ jobs:
       run: |
         echo "🧪 Running smoke tests..."
         
-        # Check pods are running
         RUNNING_PODS=$(kubectl get pods -l app=iris-api -o json | jq '.items | length')
         echo "Running pods: $RUNNING_PODS"
         
@@ -438,7 +420,6 @@ jobs:
           exit 1
         fi
         
-        # Check all pods are healthy
         READY_PODS=$(kubectl get pods -l app=iris-api -o json | jq '[.items[] | select(.status.phase=="Running")] | length')
         echo "Ready pods: $READY_PODS"
         
