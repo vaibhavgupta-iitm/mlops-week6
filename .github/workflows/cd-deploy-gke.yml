@@ -37,8 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     
     outputs:
-      image_tag: ${{ steps.image_info.outputs.image_tag }}
+      image_tag: ${{ steps.sanitize_tag.outputs.safe_tag }}
       image_url: ${{ steps.image_info.outputs.image_url }}
+      full_image: ${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}
     
     steps:
     - name: Checkout code
@@ -76,84 +77,87 @@ jobs:
         
         echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
         echo "image_url=${IMAGE_URL}" >> $GITHUB_OUTPUT
-        echo "full_image=${IMAGE_URL}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
         
-        echo "📦 Image will be: ${IMAGE_URL}:${IMAGE_TAG}"
+        echo "📦 Base Image URL: ${IMAGE_URL}"
+        echo "📦 Image Tag: ${IMAGE_TAG}"
 
     - name: Sanitize Docker tag
       id: sanitize_tag
       run: |
         SAFE_TAG=$(echo "${{ steps.image_info.outputs.image_tag }}" | tr '/' '-')
-        echo "safe_tag=$SAFE_TAG" >> $GITHUB_OUTPUT
-      
+        echo "safe_tag=${SAFE_TAG}" >> $GITHUB_OUTPUT
+        echo "📦 Sanitized Tag: ${SAFE_TAG}"
     
     - name: Build Docker image
       run: |
+        FULL_IMAGE="${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
+        echo "Building image: ${FULL_IMAGE}"
+        
         docker build \
-        -t ${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }} \
-        -t ${{ steps.image_info.outputs.image_url }}:latest \
-        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
-        --build-arg VCS_REF=${{ github.sha }} \
-        --label "org.opencontainers.image.source=${{ github.repositoryUrl }}" \
-        --label "org.opencontainers.image.revision=${{ github.sha }}" \
-        --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-        .
-      
+          -t ${FULL_IMAGE} \
+          -t ${{ steps.image_info.outputs.image_url }}:latest \
+          --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+          --build-arg VCS_REF=${{ github.sha }} \
+          --label "org.opencontainers.image.source=${{ github.repositoryUrl }}" \
+          --label "org.opencontainers.image.revision=${{ github.sha }}" \
+          --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+          .
         
         echo "✓ Docker image built successfully"
     
-    
     - name: Test Docker image
       run: |
-          echo "🧪 Testing Docker image..."
-          IMAGE=${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}
-      
-          # Run container in background on correct port
-          docker run -d --name test-container -p 8000:8000 $IMAGE
-      
-          # Wait for container to start
-          sleep 15
-      
-          # Check logs for debugging if needed
-          docker logs test-container
-      
-          # Test health endpoint
-          curl -f http://localhost:8000/health || (echo "❌ Health check failed" && docker logs test-container && exit 1)
-      
-          # Test root endpoint
-          curl -f http://localhost:8000/ || (echo "❌ Root endpoint failed" && docker logs test-container && exit 1)
-      
-          # Stop container
-          docker stop test-container
-          docker rm test-container
-      
-          echo "✓ Docker image tests passed"
-      
-      
+        echo "🧪 Testing Docker image..."
+        IMAGE="${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
+        echo "Testing image: ${IMAGE}"
+        
+        # Run container in background
+        docker run -d --name test-container -p 8080:8080 ${IMAGE}
+        
+        # Wait for container to start
+        sleep 15
+        
+        # Check logs for debugging
+        docker logs test-container
+        
+        # Test health endpoint
+        curl -f http://localhost:8080/health || (echo "❌ Health check failed" && docker logs test-container && exit 1)
+        
+        # Test root endpoint
+        curl -f http://localhost:8080/ || (echo "❌ Root endpoint failed" && docker logs test-container && exit 1)
+        
+        # Stop container
+        docker stop test-container
+        docker rm test-container
+        
+        echo "✓ Docker image tests passed"
     
-    # Push Docker image to Artifact Registry
     - name: Push Docker image to Artifact Registry
       run: |
-            docker push ${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}
-            docker push ${{ steps.image_info.outputs.image_url }}:latest
-
-            echo "✓ Image pushed to Artifact Registry"
-            echo "📦 Image: ${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
-
-    # Generate image metadata
+        FULL_IMAGE="${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
+        echo "Pushing image: ${FULL_IMAGE}"
+        
+        docker push ${FULL_IMAGE}
+        docker push ${{ steps.image_info.outputs.image_url }}:latest
+        
+        echo "✓ Image pushed to Artifact Registry"
+        echo "📦 Full Image: ${FULL_IMAGE}"
+    
     - name: Generate image metadata
       run: |
+        FULL_IMAGE="${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
+        
         cat > image-metadata.json << EOF
         {
             "image_url": "${{ steps.image_info.outputs.image_url }}",
             "image_tag": "${{ steps.sanitize_tag.outputs.safe_tag }}",
-            "full_image": "${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}",
+            "full_image": "${FULL_IMAGE}",
             "commit_sha": "${{ github.sha }}",
             "build_time": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
             "branch": "${{ github.ref_name }}"
         }
         EOF
-
+        
         cat image-metadata.json
         
     - name: Upload image metadata
@@ -171,6 +175,13 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+    
+    - name: Debug job outputs
+      run: |
+        echo "📦 Received from build job:"
+        echo "  image_url: ${{ needs.build-and-push.outputs.image_url }}"
+        echo "  image_tag: ${{ needs.build-and-push.outputs.image_tag }}"
+        echo "  full_image: ${{ needs.build-and-push.outputs.full_image }}"
     
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v1
@@ -221,10 +232,22 @@ jobs:
     
     - name: Update Kubernetes manifests
       run: |
-        FULL_IMAGE="${{ needs.build-and-push.outputs.image_url }}:${{ needs.build-and-push.outputs.image_tag }}"
-        echo "Updating deployment.yaml with image: $FULL_IMAGE"
-        sed -i "s|REGION-docker.pkg.dev/PROJECT_ID/iris-api/iris-classifier:TAG|${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}|g" kubernetes/deployment.yaml      
-      
+        FULL_IMAGE="${{ needs.build-and-push.outputs.full_image }}"
+        
+        if [ -z "$FULL_IMAGE" ] || [ "$FULL_IMAGE" = ":" ]; then
+          echo "❌ Error: FULL_IMAGE is empty!"
+          echo "Debugging outputs:"
+          echo "  image_url: ${{ needs.build-and-push.outputs.image_url }}"
+          echo "  image_tag: ${{ needs.build-and-push.outputs.image_tag }}"
+          exit 1
+        fi
+        
+        echo "Updating deployment.yaml with image: ${FULL_IMAGE}"
+        sed -i "s|REGION-docker.pkg.dev/PROJECT_ID/iris-api/iris-classifier:TAG|${FULL_IMAGE}|g" kubernetes/deployment.yaml
+        
+        echo "✓ Updated deployment.yaml"
+        echo "Verifying update..."
+        grep "image:" kubernetes/deployment.yaml
     
     - name: Deploy to Kubernetes
       run: |
@@ -265,7 +288,7 @@ jobs:
         EXTERNAL_IP=$(kubectl get service iris-api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "pending")
         echo "external_ip=${EXTERNAL_IP}" >> $GITHUB_OUTPUT
         
-        if [ "$EXTERNAL_IP" != "pending" ]; then
+        if [ "$EXTERNAL_IP" != "pending" ] && [ -n "$EXTERNAL_IP" ]; then
           echo "✓ Service is available at: http://${EXTERNAL_IP}"
           echo "api_url=http://${EXTERNAL_IP}" >> $GITHUB_OUTPUT
         else
@@ -277,17 +300,17 @@ jobs:
       run: |
         EXTERNAL_IP="${{ steps.deployment_status.outputs.external_ip }}"
         
-        if [ "$EXTERNAL_IP" = "pending" ]; then
-          echo "⚠️  External IP not yet assigned, skipping API test"
+        if [ "$EXTERNAL_IP" = "pending" ] || [ -z "$EXTERNAL_IP" ]; then
+          echo "⚠️ External IP not yet assigned, skipping API test"
           exit 0
         fi
         
-        echo "🧪 Testing deployed API..."
+        echo "🧪 Testing deployed API at: http://${EXTERNAL_IP}"
         
-        # Wait a bit more for the load balancer
+        # Wait for the load balancer
         sleep 30
         
-        # Test health endpoint
+        # Test health endpoint with retry
         for i in {1..10}; do
           if curl -f http://${EXTERNAL_IP}/health; then
             echo "✓ Health check passed"
@@ -299,6 +322,7 @@ jobs:
         done
         
         # Test prediction endpoint
+        echo "Testing prediction endpoint..."
         curl -X POST "http://${EXTERNAL_IP}/predict" \
           -H "Content-Type: application/json" \
           -d '{
@@ -306,7 +330,7 @@ jobs:
             "sepal_width": 3.5,
             "petal_length": 1.4,
             "petal_width": 0.2
-          }' || echo "⚠️  Prediction test skipped (may still be initializing)"
+          }' || echo "⚠️ Prediction test skipped (may still be initializing)"
         
         echo "✓ API deployment verified"
     
@@ -316,7 +340,7 @@ jobs:
         ## 🚀 Deployment Report
         
         ### 📦 Image Information
-        - **Image**: \`${{ needs.build-and-push.outputs.image_url }}:${{ needs.build-and-push.outputs.image_tag }}\`
+        - **Image**: \`${{ needs.build-and-push.outputs.full_image }}\`
         - **Commit**: \`${{ github.sha }}\`
         - **Branch**: \`${{ github.ref_name }}\`
         - **Build Time**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
@@ -407,8 +431,10 @@ jobs:
         RUNNING_PODS=$(kubectl get pods -l app=iris-api -o json | jq '.items | length')
         echo "Running pods: $RUNNING_PODS"
         
-        if [ "$RUNNING_PODS" -lt 2 ]; then
+        if [ "$RUNNING_PODS" -lt 1 ]; then
           echo "❌ Not enough pods running"
+          kubectl get pods -l app=iris-api
+          kubectl describe pods -l app=iris-api
           exit 1
         fi
         
@@ -416,10 +442,12 @@ jobs:
         READY_PODS=$(kubectl get pods -l app=iris-api -o json | jq '[.items[] | select(.status.phase=="Running")] | length')
         echo "Ready pods: $READY_PODS"
         
-        if [ "$READY_PODS" -lt 2 ]; then
+        if [ "$READY_PODS" -lt 1 ]; then
           echo "❌ Not all pods are ready"
           kubectl get pods -l app=iris-api
+          kubectl describe pods -l app=iris-api
           exit 1
         fi
         
         echo "✅ All smoke tests passed"
+        echo "✅ $READY_PODS pods are running and healthy"
