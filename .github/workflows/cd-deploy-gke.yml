@@ -221,12 +221,10 @@ jobs:
     
     - name: Update Kubernetes manifests
       run: |
-        # Update deployment with new image
-        sed -i "s|REGION-docker.pkg.dev/PROJECT_ID/iris-api/iris-classifier:TAG|${{ needs.build-and-push.outputs.image_url }}:${{ needs.build-and-push.outputs.image_tag }}|g" kubernetes/deployment.yaml
-        
-        echo "✓ Kubernetes manifests updated"
-        echo "📄 Deployment manifest:"
-        cat kubernetes/deployment.yaml | grep "image:"
+        FULL_IMAGE="${{ needs.build-and-push.outputs.image_url }}:${{ needs.build-and-push.outputs.image_tag }}"
+        echo "Updating deployment.yaml with image: $FULL_IMAGE"
+        sed -i "s|REGION-docker.pkg.dev/PROJECT_ID/iris-api/iris-classifier:TAG|$FULL_IMAGE|g" kubernetes/deployment.yaml
+      
     
     - name: Deploy to Kubernetes
       run: |
