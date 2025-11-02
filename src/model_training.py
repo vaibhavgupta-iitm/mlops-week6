@@ -190,14 +190,6 @@ class ModelTrainer:
     def evaluate_model(self, X_test, y_test, log_to_mlflow: bool = True) -> Dict[str, Any]:
         """
         Evaluate the trained model and optionally log to MLflow.
-        
-        Args:
-            X_test: Test features
-            y_test: Test labels
-            log_to_mlflow: Whether to log metrics to MLflow
-            
-        Returns:
-            Dictionary containing evaluation metrics
         """
         if self.model is None:
             raise ValueError("Model not trained yet. Call train_model first.")
@@ -217,54 +209,58 @@ class ModelTrainer:
                 'classification_report': class_report,
                 'confusion_matrix': conf_matrix.tolist()
             }
-            
+
             if log_to_mlflow:
-                # Get the current active run or use the parent run
-                if mlflow.active_run() is None:
-                    # If no active run, we need to fetch from registry or create new
-                    logger.warning("No active MLflow run. Metrics not logged.")
+                # Always log inside an MLflow run
+                active_run = mlflow.active_run()
+                if active_run is None:
+                    logger.info("Starting a new MLflow run for evaluation.")
+                    run_context = mlflow.start_run(run_name="evaluation")
                 else:
-                    # Log test metrics
+                    run_context = None  # already inside a run
+
+                try:
+                    if run_context:
+                        run_context.__enter__()
+
+                    # Log metrics
                     mlflow.log_metric("test_accuracy", accuracy)
                     mlflow.log_metric("test_f1_score", f1)
-                    
-                    # Log per-class metrics
+
                     for class_name in ['setosa', 'versicolor', 'virginica']:
                         if class_name in class_report:
-                            mlflow.log_metric(f"test_{class_name}_precision", 
-                                            class_report[class_name]['precision'])
-                            mlflow.log_metric(f"test_{class_name}_recall", 
-                                            class_report[class_name]['recall'])
-                            mlflow.log_metric(f"test_{class_name}_f1", 
-                                            class_report[class_name]['f1-score'])
-                    
+                            mlflow.log_metric(f"test_{class_name}_precision", class_report[class_name]['precision'])
+                            mlflow.log_metric(f"test_{class_name}_recall", class_report[class_name]['recall'])
+                            mlflow.log_metric(f"test_{class_name}_f1", class_report[class_name]['f1-score'])
+
                     # Log confusion matrix as artifact
                     import matplotlib.pyplot as plt
                     import seaborn as sns
                     
                     plt.figure(figsize=(8, 6))
                     sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
-                              xticklabels=['setosa', 'versicolor', 'virginica'],
-                              yticklabels=['setosa', 'versicolor', 'virginica'])
+                                xticklabels=['setosa', 'versicolor', 'virginica'],
+                                yticklabels=['setosa', 'versicolor', 'virginica'])
                     plt.title('Confusion Matrix')
                     plt.ylabel('True Label')
                     plt.xlabel('Predicted Label')
                     
-                    # Save and log the plot
                     plt.savefig('confusion_matrix.png')
                     mlflow.log_artifact('confusion_matrix.png')
                     plt.close()
-                    
-                    # Clean up the local file
-                    if os.path.exists('confusion_matrix.png'):
-                        os.remove('confusion_matrix.png')
-            
+                    os.remove('confusion_matrix.png')
+
+                finally:
+                    if run_context:
+                        run_context.__exit__(None, None, None)
+
             logger.info(f"Model evaluation completed - Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
             return metrics
-            
+
         except Exception as e:
             logger.error(f"Error evaluating model: {e}")
             raise
+
     
     def load_model_from_mlflow(self, 
                                model_name: str = "iris-classifier",
