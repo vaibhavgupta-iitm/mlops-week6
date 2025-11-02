@@ -134,6 +134,8 @@ jobs:
           echo "⚠️  Production requires higher standards than dev (${THRESHOLD} vs 0.85)"
           exit 1
         fi
+
+    
     
     - name: Run data validation checks
       run: |
@@ -218,3 +220,13 @@ jobs:
         REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         cml comment create report.md
+
+    - name: Promote validated model to Production
+      if: ${{ steps.evaluate.outputs.should_deploy == 'true' }}
+      run: |
+        echo "🚀 Promoting model to Production in MLflow..."
+        python main.py \
+          --mlflow-tracking-uri "${MLFLOW_TRACKING_URI:-file:./mlruns}" \
+          --mlflow-experiment-name iris-classification \
+          --promote-to-production
+        echo "✅ Model successfully promoted to Production stage!"
