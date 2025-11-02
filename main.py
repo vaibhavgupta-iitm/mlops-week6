@@ -168,27 +168,44 @@ def main():
             
             # Promote to production if requested
             if args.promote_to_production:
-                logger.info("Promoting model to Production stage...")
+                logger.info("Promoting model to Production...")
                 
                 # Use the training run_id where the model was actually logged
                 if training_run_id:
                     logger.info(f"Using training run_id: {training_run_id}")
-                    model_trainer.promote_model_to_production(
-                        model_name="iris-classifier",
-                        run_id=training_run_id,
-                        use_alias=False  # Use stages with archive_existing_versions=False to avoid YAML bug
-                    )
+                    try:
+                        # Try using aliases first (works better with file store)
+                        model_trainer.promote_model_to_production(
+                            model_name="iris-classifier",
+                            run_id=training_run_id,
+                            use_alias=True  # Use aliases to avoid file store bug
+                        )
+                    except Exception as e:
+                        logger.warning(f"Alias-based promotion failed: {e}")
+                        logger.info("Trying stage-based promotion with workaround...")
+                        model_trainer.promote_model_to_production(
+                            model_name="iris-classifier",
+                            run_id=training_run_id,
+                            use_alias=False
+                        )
                 else:
                     logger.warning("No training run_id found, falling back to best model search")
                     best_run_id = model_trainer.get_best_model_from_experiment(
                         experiment_name=args.mlflow_experiment_name,
                         metric="test_accuracy"
                     )
-                    model_trainer.promote_model_to_production(
-                        model_name="iris-classifier",
-                        run_id=best_run_id,
-                        use_alias=False
-                    )
+                    try:
+                        model_trainer.promote_model_to_production(
+                            model_name="iris-classifier",
+                            run_id=best_run_id,
+                            use_alias=True
+                        )
+                    except:
+                        model_trainer.promote_model_to_production(
+                            model_name="iris-classifier",
+                            run_id=best_run_id,
+                            use_alias=False
+                        )
         
         # Save metrics to file
         logger.info("Saving metrics...")
