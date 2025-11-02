@@ -62,14 +62,7 @@ jobs:
         dvc pull iris-dvc-pipeline/v1_data.csv.dvc
         echo "✓ Data pulled from DVC"
         echo "ℹ Models are now managed by MLflow, not DVC"
-    
-    - name: Upload coverage reports
-      uses: codecov/codecov-action@v5
-      with:
-        flags: dev
-        name: dev-coverage
-        token: ${{ secrets.CODECOV_TOKEN }}
-      continue-on-error: true
+
     
     - name: Train and evaluate model (or load from MLflow)
       id: evaluate
