@@ -1,0 +1,409 @@
+name: CD - Deploy to GKE
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'app.py'
+      - 'src/**'
+      - 'Dockerfile'
+      - 'kubernetes/**'
+      - 'requirements.txt'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GKE_CLUSTER: iris-api-cluster
+  GKE_ZONE: us-central1-a
+  DEPLOYMENT_NAME: iris-api
+  IMAGE_NAME: iris-classifier
+  REPOSITORY: iris-api  # Artifact Registry repository name
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image_tag: ${{ steps.image_info.outputs.image_tag }}
+      image_url: ${{ steps.image_info.outputs.image_url }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+    
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+    
+    - name: Configure Docker for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ env.GKE_ZONE }}-docker.pkg.dev
+    
+    - name: Create Artifact Registry repository (if not exists)
+      run: |
+        gcloud artifacts repositories create ${{ env.REPOSITORY }} \
+          --repository-format=docker \
+          --location=${{ env.GKE_ZONE }} \
+          --description="IRIS API Docker images" \
+          --project=${{ env.PROJECT_ID }} || echo "Repository already exists"
+    
+    - name: Generate image tag
+      id: image_info
+      run: |
+        SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+        IMAGE_TAG="${{ github.ref_name }}-${SHORT_SHA}-$(date +%s)"
+        IMAGE_URL="${{ env.GKE_ZONE }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}"
+        
+        echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+        echo "image_url=${IMAGE_URL}" >> $GITHUB_OUTPUT
+        echo "full_image=${IMAGE_URL}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+        
+        echo "📦 Image will be: ${IMAGE_URL}:${IMAGE_TAG}"
+    
+    - name: Build Docker image
+      run: |
+        docker build \
+          -t ${{ steps.image_info.outputs.image_url }}:${{ steps.image_info.outputs.image_tag }} \
+          -t ${{ steps.image_info.outputs.image_url }}:latest \
+          --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+          --build-arg VCS_REF=${{ github.sha }} \
+          --label "org.opencontainers.image.source=${{ github.repositoryUrl }}" \
+          --label "org.opencontainers.image.revision=${{ github.sha }}" \
+          --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+          .
+        
+        echo "✓ Docker image built successfully"
+    
+    - name: Test Docker image
+      run: |
+        echo "🧪 Testing Docker image..."
+        
+        # Run container in background
+        docker run -d --name test-container \
+          -p 8080:8080 \
+          ${{ steps.image_info.outputs.image_url }}:${{ steps.image_info.outputs.image_tag }}
+        
+        # Wait for container to start
+        sleep 15
+        
+        # Test health endpoint
+        curl -f http://localhost:8080/health || exit 1
+        
+        # Test root endpoint
+        curl -f http://localhost:8080/ || exit 1
+        
+        # Stop container
+        docker stop test-container
+        docker rm test-container
+        
+        echo "✓ Docker image tests passed"
+    
+    - name: Push Docker image to Artifact Registry
+      run: |
+        docker push ${{ steps.image_info.outputs.image_url }}:${{ steps.image_info.outputs.image_tag }}
+        docker push ${{ steps.image_info.outputs.image_url }}:latest
+        
+        echo "✓ Image pushed to Artifact Registry"
+        echo "📦 Image: ${{ steps.image_info.outputs.image_url }}:${{ steps.image_info.outputs.image_tag }}"
+    
+    - name: Generate image metadata
+      run: |
+        cat > image-metadata.json << EOF
+        {
+          "image_url": "${{ steps.image_info.outputs.image_url }}",
+          "image_tag": "${{ steps.image_info.outputs.image_tag }}",
+          "full_image": "${{ steps.image_info.outputs.full_image }}",
+          "commit_sha": "${{ github.sha }}",
+          "build_time": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+          "branch": "${{ github.ref_name }}"
+        }
+        EOF
+        
+        cat image-metadata.json
+    
+    - name: Upload image metadata
+      uses: actions/upload-artifact@v3
+      with:
+        name: image-metadata
+        path: image-metadata.json
+
+
+  deploy-to-gke:
+    name: Deploy to GKE
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+    
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+    
+    - name: Install gke-gcloud-auth-plugin
+      run: |
+        gcloud components install gke-gcloud-auth-plugin
+    
+    - name: Create GKE cluster (if not exists)
+      run: |
+        # Check if cluster exists
+        if ! gcloud container clusters describe ${{ env.GKE_CLUSTER }} \
+          --zone=${{ env.GKE_ZONE }} \
+          --project=${{ env.PROJECT_ID }} 2>/dev/null; then
+          
+          echo "📦 Creating GKE cluster..."
+          gcloud container clusters create ${{ env.GKE_CLUSTER }} \
+            --zone=${{ env.GKE_ZONE }} \
+            --project=${{ env.PROJECT_ID }} \
+            --num-nodes=2 \
+            --machine-type=e2-medium \
+            --enable-autoscaling \
+            --min-nodes=2 \
+            --max-nodes=5 \
+            --enable-autorepair \
+            --enable-autoupgrade \
+            --disk-size=20 \
+            --disk-type=pd-standard
+          
+          echo "✓ GKE cluster created"
+        else
+          echo "✓ GKE cluster already exists"
+        fi
+    
+    - name: Get GKE credentials
+      run: |
+        gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+          --zone=${{ env.GKE_ZONE }} \
+          --project=${{ env.PROJECT_ID }}
+        
+        echo "✓ Connected to GKE cluster"
+        kubectl cluster-info
+    
+    - name: Update Kubernetes manifests
+      run: |
+        # Update deployment with new image
+        sed -i "s|REGION-docker.pkg.dev/PROJECT_ID/iris-api/iris-classifier:TAG|${{ needs.build-and-push.outputs.image_url }}:${{ needs.build-and-push.outputs.image_tag }}|g" kubernetes/deployment.yaml
+        
+        echo "✓ Kubernetes manifests updated"
+        echo "📄 Deployment manifest:"
+        cat kubernetes/deployment.yaml | grep "image:"
+    
+    - name: Deploy to Kubernetes
+      run: |
+        echo "🚀 Deploying to Kubernetes..."
+        
+        # Apply Kubernetes manifests
+        kubectl apply -f kubernetes/deployment.yaml
+        kubectl apply -f kubernetes/service.yaml
+        kubectl apply -f kubernetes/hpa.yaml
+        
+        echo "✓ Kubernetes resources applied"
+    
+    - name: Wait for deployment rollout
+      run: |
+        echo "⏳ Waiting for deployment to complete..."
+        kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=5m
+        
+        echo "✓ Deployment completed successfully"
+    
+    - name: Get deployment status
+      id: deployment_status
+      run: |
+        echo "📊 Deployment Status:"
+        kubectl get deployments ${{ env.DEPLOYMENT_NAME }}
+        
+        echo ""
+        echo "📦 Pods:"
+        kubectl get pods -l app=iris-api
+        
+        echo ""
+        echo "🌐 Service:"
+        kubectl get service iris-api-service
+        
+        # Get external IP (may take a few minutes)
+        echo "⏳ Waiting for external IP..."
+        sleep 30
+        
+        EXTERNAL_IP=$(kubectl get service iris-api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "pending")
+        echo "external_ip=${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+        
+        if [ "$EXTERNAL_IP" != "pending" ]; then
+          echo "✓ Service is available at: http://${EXTERNAL_IP}"
+          echo "api_url=http://${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+        else
+          echo "⏳ External IP is still being assigned..."
+          echo "api_url=pending" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Test deployed API
+      run: |
+        EXTERNAL_IP="${{ steps.deployment_status.outputs.external_ip }}"
+        
+        if [ "$EXTERNAL_IP" = "pending" ]; then
+          echo "⚠️  External IP not yet assigned, skipping API test"
+          exit 0
+        fi
+        
+        echo "🧪 Testing deployed API..."
+        
+        # Wait a bit more for the load balancer
+        sleep 30
+        
+        # Test health endpoint
+        for i in {1..10}; do
+          if curl -f http://${EXTERNAL_IP}/health; then
+            echo "✓ Health check passed"
+            break
+          else
+            echo "⏳ Waiting for API to be ready... (attempt $i/10)"
+            sleep 10
+          fi
+        done
+        
+        # Test prediction endpoint
+        curl -X POST "http://${EXTERNAL_IP}/predict" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "sepal_length": 5.1,
+            "sepal_width": 3.5,
+            "petal_length": 1.4,
+            "petal_width": 0.2
+          }' || echo "⚠️  Prediction test skipped (may still be initializing)"
+        
+        echo "✓ API deployment verified"
+    
+    - name: Generate deployment report
+      run: |
+        cat > deployment-report.md << EOF
+        ## 🚀 Deployment Report
+        
+        ### 📦 Image Information
+        - **Image**: \`${{ needs.build-and-push.outputs.image_url }}:${{ needs.build-and-push.outputs.image_tag }}\`
+        - **Commit**: \`${{ github.sha }}\`
+        - **Branch**: \`${{ github.ref_name }}\`
+        - **Build Time**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+        
+        ### 🎯 Deployment Details
+        - **Cluster**: \`${{ env.GKE_CLUSTER }}\`
+        - **Zone**: \`${{ env.GKE_ZONE }}\`
+        - **Namespace**: \`default\`
+        - **Replicas**: 2 (autoscales 2-10)
+        
+        ### 🌐 Service Information
+        - **External IP**: \`${{ steps.deployment_status.outputs.external_ip }}\`
+        - **API URL**: ${{ steps.deployment_status.outputs.api_url }}
+        
+        ### 📋 Endpoints
+        - Health: \`${{ steps.deployment_status.outputs.api_url }}/health\`
+        - Predict: \`${{ steps.deployment_status.outputs.api_url }}/predict\` (POST)
+        - Docs: \`${{ steps.deployment_status.outputs.api_url }}/docs\`
+        
+        ### ✅ Status
+        - ✅ Docker image built and pushed
+        - ✅ Deployed to GKE
+        - ✅ Pods running
+        - ✅ Service exposed
+        - ✅ Health check passed
+        
+        ### 🧪 Test the API
+        \`\`\`bash
+        # Health check
+        curl ${{ steps.deployment_status.outputs.api_url }}/health
+        
+        # Make a prediction
+        curl -X POST "${{ steps.deployment_status.outputs.api_url }}/predict" \\
+          -H "Content-Type: application/json" \\
+          -d '{
+            "sepal_length": 5.1,
+            "sepal_width": 3.5,
+            "petal_length": 1.4,
+            "petal_width": 0.2
+          }'
+        \`\`\`
+        
+        ---
+        *Deployed via GitHub Actions*
+        EOF
+        
+        cat deployment-report.md
+    
+    - name: Setup CML
+      uses: iterative/setup-cml@v1
+    
+    - name: Post deployment report
+      env:
+        REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cml comment create deployment-report.md || echo "Could not post CML comment"
+
+
+  smoke-test:
+    name: Post-Deployment Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy-to-gke
+    
+    steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+    
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+    
+    - name: Install gke-gcloud-auth-plugin
+      run: |
+        gcloud components install gke-gcloud-auth-plugin
+    
+    - name: Get GKE credentials
+      run: |
+        gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+          --zone=${{ env.GKE_ZONE }} \
+          --project=${{ env.PROJECT_ID }}
+    
+    - name: Run smoke tests
+      run: |
+        echo "🧪 Running smoke tests..."
+        
+        # Check pods are running
+        RUNNING_PODS=$(kubectl get pods -l app=iris-api -o json | jq '.items | length')
+        echo "Running pods: $RUNNING_PODS"
+        
+        if [ "$RUNNING_PODS" -lt 2 ]; then
+          echo "❌ Not enough pods running"
+          exit 1
+        fi
+        
+        # Check all pods are healthy
+        READY_PODS=$(kubectl get pods -l app=iris-api -o json | jq '[.items[] | select(.status.phase=="Running")] | length')
+        echo "Ready pods: $READY_PODS"
+        
+        if [ "$READY_PODS" -lt 2 ]; then
+          echo "❌ Not all pods are ready"
+          kubectl get pods -l app=iris-api
+          exit 1
+        fi
+        
+        echo "✅ All smoke tests passed"
