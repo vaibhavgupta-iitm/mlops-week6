@@ -104,28 +104,30 @@ jobs:
     
     - name: Test Docker image
       run: |
-        echo "🧪 Testing Docker image..."
-        
-        IMAGE=${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}
-        echo "Running container from image: $IMAGE"
-        
-        # Run container in background
-        docker run -d --name test-container -p 8080:8080 $IMAGE
-        
-        # Wait for container to start
-        sleep 15
-        
-        # Test health endpoint
-        curl -f http://localhost:8080/health || exit 1
-        
-        # Test root endpoint
-        curl -f http://localhost:8080/ || exit 1
-        
-        # Stop and remove container
-        docker stop test-container
-        docker rm test-container
-        
-        echo "✓ Docker image tests passed"
+          echo "🧪 Testing Docker image..."
+          IMAGE=${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}
+      
+          # Run container in background on correct port
+          docker run -d --name test-container -p 8000:8000 $IMAGE
+      
+          # Wait for container to start
+          sleep 15
+      
+          # Check logs for debugging if needed
+          docker logs test-container
+      
+          # Test health endpoint
+          curl -f http://localhost:8000/health || (echo "❌ Health check failed" && docker logs test-container && exit 1)
+      
+          # Test root endpoint
+          curl -f http://localhost:8000/ || (echo "❌ Root endpoint failed" && docker logs test-container && exit 1)
+      
+          # Stop container
+          docker stop test-container
+          docker rm test-container
+      
+          echo "✓ Docker image tests passed"
+      
       
     
     - name: Push Docker image to Artifact Registry
