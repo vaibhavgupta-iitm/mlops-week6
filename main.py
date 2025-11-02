@@ -175,7 +175,8 @@ def main():
                     logger.info(f"Using training run_id: {training_run_id}")
                     model_trainer.promote_model_to_production(
                         model_name="iris-classifier",
-                        run_id=training_run_id
+                        run_id=training_run_id,
+                        use_alias=False  # Use stages with archive_existing_versions=False to avoid YAML bug
                     )
                 else:
                     logger.warning("No training run_id found, falling back to best model search")
@@ -185,7 +186,8 @@ def main():
                     )
                     model_trainer.promote_model_to_production(
                         model_name="iris-classifier",
-                        run_id=best_run_id
+                        run_id=best_run_id,
+                        use_alias=False
                     )
         
         # Save metrics to file

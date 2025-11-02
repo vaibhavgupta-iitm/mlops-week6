@@ -43,6 +43,7 @@ class ModelTrainer:
         self.model = None
         self.best_params = None
         self.current_run_id = None  # Store the run_id where model was logged
+        self.registered_model_version = None  # Store the registered version
         
         # Setup MLflow
         if mlflow_tracking_uri:
@@ -87,7 +88,7 @@ class ModelTrainer:
                     input_example = X_train.iloc[:5] if isinstance(X_train, pd.DataFrame) else None
                     signature = mlflow.models.infer_signature(X_train, y_train)
 
-                    mlflow.sklearn.log_model(
+                    model_info = mlflow.sklearn.log_model(
                         sk_model=self.model,
                         artifact_path="model",
                         registered_model_name="iris-classifier",
@@ -278,25 +279,38 @@ class ModelTrainer:
     def load_model_from_mlflow(self, 
                                model_name: str = "iris-classifier",
                                stage: str = "Production",
-                               version: Optional[int] = None) -> DecisionTreeClassifier:
+                               version: Optional[int] = None,
+                               alias: Optional[str] = None) -> DecisionTreeClassifier:
         """
         Load model from MLflow model registry.
         
         Args:
             model_name: Name of the registered model
-            stage: Stage of the model (Production, Staging, None)
-            version: Specific version number (overrides stage if provided)
+            stage: Stage of the model (Production, Staging, None) - DEPRECATED
+            version: Specific version number
+            alias: Model alias (e.g., 'champion', 'production') - NEW APPROACH
             
         Returns:
             Loaded model
         """
         try:
-            if version:
+            if alias:
+                model_uri = f"models:/{model_name}@{alias}"
+                logger.info(f"Loading model with alias '{alias}' from MLflow registry")
+            elif version:
                 model_uri = f"models:/{model_name}/{version}"
                 logger.info(f"Loading model version {version} from MLflow registry")
             else:
-                model_uri = f"models:/{model_name}/{stage}"
-                logger.info(f"Loading model from stage '{stage}' from MLflow registry")
+                # Try alias first (new way), fall back to stage (old way)
+                try:
+                    model_uri = f"models:/{model_name}@champion"
+                    logger.info(f"Attempting to load model with alias 'champion' from MLflow registry")
+                    self.model = mlflow.sklearn.load_model(model_uri)
+                    logger.info(f"Model loaded successfully from: {model_uri}")
+                    return self.model
+                except:
+                    model_uri = f"models:/{model_name}/{stage}"
+                    logger.info(f"Falling back to stage '{stage}' from MLflow registry")
             
             self.model = mlflow.sklearn.load_model(model_uri)
             logger.info(f"Model loaded successfully from: {model_uri}")
@@ -348,14 +362,16 @@ class ModelTrainer:
     def promote_model_to_production(self, 
                                     model_name: str = "iris-classifier",
                                     version: Optional[int] = None,
-                                    run_id: Optional[str] = None):
+                                    run_id: Optional[str] = None,
+                                    use_alias: bool = True):
         """
-        Promote a model version to Production stage.
+        Promote a model version to Production using aliases (new way) or stages (deprecated).
         
         Args:
             model_name: Name of the registered model
             version: Version number to promote
             run_id: Run ID to promote (if version not provided)
+            use_alias: Use new alias system instead of deprecated stages
         """
         try:
             from mlflow.tracking import MlflowClient
@@ -399,16 +415,28 @@ class ModelTrainer:
             if version is None:
                 raise ValueError("Either version or run_id must be provided")
             
-            # Transition to Production
-            logger.info(f"Transitioning model {model_name} version {version} to Production stage...")
-            client.transition_model_version_stage(
-                name=model_name,
-                version=version,
-                stage="Production",
-                archive_existing_versions=True
-            )
-            
-            logger.info(f"✓ Model {model_name} version {version} promoted to Production")
+            # Use aliases (new recommended way)
+            if use_alias:
+                logger.info(f"Setting alias 'champion' for model {model_name} version {version}...")
+                client.set_registered_model_alias(
+                    name=model_name,
+                    alias="champion",
+                    version=version
+                )
+                logger.info(f"✓ Model {model_name} version {version} promoted with alias 'champion'")
+            else:
+                # Use stages (deprecated but more compatible with file store)
+                logger.info(f"Transitioning model {model_name} version {version} to Production stage...")
+                
+                # Don't archive existing versions - this causes the YAML serialization error
+                client.transition_model_version_stage(
+                    name=model_name,
+                    version=version,
+                    stage="Production",
+                    archive_existing_versions=False  # Changed to False to avoid serialization issues
+                )
+                
+                logger.info(f"✓ Model {model_name} version {version} promoted to Production")
             
         except Exception as e:
             logger.error(f"Error promoting model: {e}")
