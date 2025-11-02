@@ -101,14 +101,16 @@ jobs:
         
         echo "✓ Docker image built successfully"
     
+    
     - name: Test Docker image
       run: |
         echo "🧪 Testing Docker image..."
         
+        IMAGE=${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}
+        echo "Running container from image: $IMAGE"
+        
         # Run container in background
-        docker run -d --name test-container \
-          -p 8080:8080 \
-          ${{ steps.image_info.outputs.image_url }}:${{ steps.image_info.outputs.image_tag }}
+        docker run -d --name test-container -p 8080:8080 $IMAGE
         
         # Wait for container to start
         sleep 15
@@ -119,11 +121,12 @@ jobs:
         # Test root endpoint
         curl -f http://localhost:8080/ || exit 1
         
-        # Stop container
+        # Stop and remove container
         docker stop test-container
         docker rm test-container
         
         echo "✓ Docker image tests passed"
+      
     
     - name: Push Docker image to Artifact Registry
       run: |
