@@ -42,6 +42,7 @@ class ModelTrainer:
         self.random_state = random_state
         self.model = None
         self.best_params = None
+        self.current_run_id = None  # Store the run_id where model was logged
         
         # Setup MLflow
         if mlflow_tracking_uri:
@@ -68,7 +69,10 @@ class ModelTrainer:
             }
             
             if log_to_mlflow:
-                with mlflow.start_run(run_name="single_model_training"):
+                with mlflow.start_run(run_name="single_model_training") as run:
+                    self.current_run_id = run.info.run_id
+                    logger.info(f"Training in MLflow run: {self.current_run_id}")
+                    
                     self.model = DecisionTreeClassifier(**params)
                     self.model.fit(X_train, y_train)
                     
@@ -85,11 +89,13 @@ class ModelTrainer:
 
                     mlflow.sklearn.log_model(
                         sk_model=self.model,
-                        name="model",
+                        artifact_path="model",
                         registered_model_name="iris-classifier",
                         input_example=input_example,
                         signature=signature
                     )
+                    
+                    logger.info(f"Model logged to MLflow in run {self.current_run_id}")
             else:
                 self.model = DecisionTreeClassifier(**params)
                 self.model.fit(X_train, y_train)
@@ -127,7 +133,10 @@ class ModelTrainer:
             }
         
         try:
-            with mlflow.start_run(run_name="hyperparameter_tuning"):
+            with mlflow.start_run(run_name="hyperparameter_tuning") as run:
+                self.current_run_id = run.info.run_id
+                logger.info(f"Hyperparameter tuning in MLflow run: {self.current_run_id}")
+                
                 # Log the parameter grid being searched
                 mlflow.log_param("param_grid", str(param_grid))
                 mlflow.log_param("cv_folds", cv)
@@ -172,7 +181,7 @@ class ModelTrainer:
 
                 mlflow.sklearn.log_model(
                     sk_model=self.model,
-                    name="model",
+                    artifact_path="model",
                     registered_model_name="iris-classifier",
                     input_example=input_example,
                     signature=signature
@@ -180,6 +189,7 @@ class ModelTrainer:
                 
                 logger.info(f"Hyperparameter tuning completed. Best params: {self.best_params}")
                 logger.info(f"Best CV score: {grid_search.best_score_:.4f}")
+                logger.info(f"Model logged to MLflow in run {self.current_run_id}")
                 
                 return self.model
                 
@@ -190,6 +200,7 @@ class ModelTrainer:
     def evaluate_model(self, X_test, y_test, log_to_mlflow: bool = True) -> Dict[str, Any]:
         """
         Evaluate the trained model and optionally log to MLflow.
+        IMPORTANT: If log_to_mlflow=True, this will log to the CURRENT active run.
         """
         if self.model is None:
             raise ValueError("Model not trained yet. Call train_model first.")
@@ -211,13 +222,16 @@ class ModelTrainer:
             }
 
             if log_to_mlflow:
-                # Always log inside an MLflow run
+                # Check if we're already in an active run
                 active_run = mlflow.active_run()
+                
+                # Only start a new run if we're not already in one
                 if active_run is None:
                     logger.info("Starting a new MLflow run for evaluation.")
                     run_context = mlflow.start_run(run_name="evaluation")
                 else:
-                    run_context = None  # already inside a run
+                    logger.info(f"Logging evaluation metrics to existing MLflow run: {active_run.info.run_id}")
+                    run_context = None  # Don't create a context manager
 
                 try:
                     if run_context:
@@ -260,7 +274,6 @@ class ModelTrainer:
         except Exception as e:
             logger.error(f"Error evaluating model: {e}")
             raise
-
     
     def load_model_from_mlflow(self, 
                                model_name: str = "iris-classifier",
@@ -346,23 +359,48 @@ class ModelTrainer:
         """
         try:
             from mlflow.tracking import MlflowClient
+            import time
+            
             client = MlflowClient()
             
             if version is None and run_id:
-                # Find version from run_id
-                model_versions = client.search_model_versions(f"name='{model_name}'")
-                for mv in model_versions:
-                    if mv.run_id == run_id:
-                        version = int(mv.version)
+                # Find version from run_id with retry logic
+                logger.info(f"Looking for model version with run_id: {run_id}")
+                
+                max_retries = 10
+                retry_delay = 2  # seconds
+                
+                for attempt in range(max_retries):
+                    model_versions = client.search_model_versions(f"name='{model_name}'")
+                    
+                    logger.info(f"Found {len(model_versions)} total versions for {model_name}")
+                    
+                    for mv in model_versions:
+                        logger.info(f"  Checking version {mv.version}, run_id: {mv.run_id}")
+                        if mv.run_id == run_id:
+                            version = int(mv.version)
+                            logger.info(f"✓ Found model version {version} for run_id: {run_id}")
+                            break
+                    
+                    if version is not None:
                         break
+                    
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Model version not found yet, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(retry_delay)
                 
                 if version is None:
-                    raise ValueError(f"No model version found for run_id: {run_id}")
+                    # List all available versions for debugging
+                    logger.error(f"Available model versions for {model_name}:")
+                    for mv in model_versions:
+                        logger.error(f"  Version {mv.version}, Run ID: {mv.run_id}, Stage: {mv.current_stage}")
+                    raise ValueError(f"No model version found for run_id: {run_id} after {max_retries} attempts")
             
             if version is None:
                 raise ValueError("Either version or run_id must be provided")
             
             # Transition to Production
+            logger.info(f"Transitioning model {model_name} version {version} to Production stage...")
             client.transition_model_version_stage(
                 name=model_name,
                 version=version,
@@ -370,7 +408,7 @@ class ModelTrainer:
                 archive_existing_versions=True
             )
             
-            logger.info(f"Model {model_name} version {version} promoted to Production")
+            logger.info(f"✓ Model {model_name} version {version} promoted to Production")
             
         except Exception as e:
             logger.error(f"Error promoting model: {e}")

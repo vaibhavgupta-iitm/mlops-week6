@@ -148,9 +148,6 @@ def main():
                 args.use_mlflow_model = False
         
         # Train new model if not loaded from registry
-        model_version = None
-        current_run_id = None
-        
         if not args.use_mlflow_model:
             if args.hyperparameter_tuning:
                 logger.info("Training model with hyperparameter tuning...")
@@ -161,46 +158,27 @@ def main():
                 logger.info("Training model with single hyperparameter set...")
                 model = model_trainer.train_model(X_train, y_train)
             
-            # Get the current run ID and model version
-            active_run = mlflow.active_run()
-            if active_run:
-                current_run_id = active_run.info.run_id
-                logger.info(f"Current run ID: {current_run_id}")
+            # Store the run_id where model was logged
+            training_run_id = model_trainer.current_run_id
+            logger.info(f"Model trained and logged in run: {training_run_id}")
             
-            # Evaluate model
+            # Evaluate model (this will log to the same run since it's still active)
             logger.info("Evaluating model...")
             metrics = model_trainer.evaluate_model(X_test, y_test, log_to_mlflow=True)
-            
-            # Get the model version that was just registered
-            if current_run_id:
-                from mlflow.tracking import MlflowClient
-                import time
-                
-                client = MlflowClient()
-                
-                # Wait a bit for registration to complete
-                time.sleep(3)
-                
-                # Find the version for this run
-                model_versions = client.search_model_versions(f"name='iris-classifier'")
-                for mv in model_versions:
-                    if mv.run_id == current_run_id:
-                        model_version = int(mv.version)
-                        logger.info(f"Model registered as version {model_version}")
-                        break
             
             # Promote to production if requested
             if args.promote_to_production:
                 logger.info("Promoting model to Production stage...")
                 
-                if model_version:
-                    # Use the version we just captured
+                # Use the training run_id where the model was actually logged
+                if training_run_id:
+                    logger.info(f"Using training run_id: {training_run_id}")
                     model_trainer.promote_model_to_production(
                         model_name="iris-classifier",
-                        version=model_version
+                        run_id=training_run_id
                     )
                 else:
-                    # Fallback to the old approach with run_id
+                    logger.warning("No training run_id found, falling back to best model search")
                     best_run_id = model_trainer.get_best_model_from_experiment(
                         experiment_name=args.mlflow_experiment_name,
                         metric="test_accuracy"
@@ -257,7 +235,7 @@ def run_comparison_experiments(model_trainer, X_train, y_train, X_test, y_test):
 
         mlflow.sklearn.log_model(
             sk_model=model_trainer.model,
-            name="model",
+            artifact_path="model",
             registered_model_name="iris-classifier",
             input_example=input_example,
             signature=signature
@@ -279,7 +257,7 @@ def run_comparison_experiments(model_trainer, X_train, y_train, X_test, y_test):
         
         mlflow.sklearn.log_model(
             sk_model=model_trainer.model,
-            name="model",
+            artifact_path="model",
             registered_model_name="iris-classifier",
             input_example=input_example,
             signature=signature
@@ -301,7 +279,7 @@ def run_comparison_experiments(model_trainer, X_train, y_train, X_test, y_test):
         
         mlflow.sklearn.log_model(
             sk_model=model_trainer.model,
-            name="model",
+            artifact_path="model",
             registered_model_name="iris-classifier",
             input_example=input_example,
             signature=signature
