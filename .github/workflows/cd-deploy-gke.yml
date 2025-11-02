@@ -130,29 +130,31 @@ jobs:
       
       
     
+    # Push Docker image to Artifact Registry
     - name: Push Docker image to Artifact Registry
       run: |
-        docker push ${{ steps.image_info.outputs.image_url }}:${{ steps.image_info.outputs.image_tag }}
-        docker push ${{ steps.image_info.outputs.image_url }}:latest
-        
-        echo "✓ Image pushed to Artifact Registry"
-        echo "📦 Image: ${{ steps.image_info.outputs.image_url }}:${{ steps.image_info.outputs.image_tag }}"
-    
+            docker push ${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}
+            docker push ${{ steps.image_info.outputs.image_url }}:latest
+
+            echo "✓ Image pushed to Artifact Registry"
+            echo "📦 Image: ${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}"
+
+    # Generate image metadata
     - name: Generate image metadata
       run: |
         cat > image-metadata.json << EOF
         {
-          "image_url": "${{ steps.image_info.outputs.image_url }}",
-          "image_tag": "${{ steps.image_info.outputs.image_tag }}",
-          "full_image": "${{ steps.image_info.outputs.full_image }}",
-          "commit_sha": "${{ github.sha }}",
-          "build_time": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
-          "branch": "${{ github.ref_name }}"
+            "image_url": "${{ steps.image_info.outputs.image_url }}",
+            "image_tag": "${{ steps.sanitize_tag.outputs.safe_tag }}",
+            "full_image": "${{ steps.image_info.outputs.image_url }}:${{ steps.sanitize_tag.outputs.safe_tag }}",
+            "commit_sha": "${{ github.sha }}",
+            "build_time": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "branch": "${{ github.ref_name }}"
         }
         EOF
-        
+
         cat image-metadata.json
-    
+        
     - name: Upload image metadata
       uses: actions/upload-artifact@v4
       with:
