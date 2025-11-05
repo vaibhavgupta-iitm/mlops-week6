@@ -6,7 +6,6 @@ Loads model from MLflow and serves predictions via REST API.
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Dict
-import mlflow.sklearn
 import numpy as np
 import logging
 from datetime import datetime
@@ -62,70 +61,6 @@ class HealthResponse(BaseModel):
     model_info: Dict
 
 
-def load_model_from_mlflow():
-    """Load model from MLflow registry or local artifacts"""
-    global model, model_info
-    
-    try:
-        # Try to load from MLflow registry (Production stage)
-        mlflow_tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "file:///./mlruns")
-        mlflow.set_tracking_uri(mlflow_tracking_uri)
-        
-        model_name = os.getenv("MODEL_NAME", "iris-classifier")
-        model_stage = os.getenv("MODEL_STAGE", "Production")
-        
-        logger.info(f"Attempting to load model '{model_name}' from stage '{model_stage}'")
-        
-        try:
-            model_uri = f"models:/{model_name}/{model_stage}"
-            model = mlflow.sklearn.load_model(model_uri)
-            model_info = {
-                "source": "mlflow_registry",
-                "model_name": model_name,
-                "stage": model_stage,
-                "tracking_uri": mlflow_tracking_uri
-            }
-            logger.info(f"✓ Model loaded from MLflow registry: {model_uri}")
-            return True
-            
-        except Exception as e:
-            logger.warning(f"Could not load from MLflow registry: {e}")
-            
-            # Fallback: Try to load from local mlruns
-            logger.info("Attempting to load from local mlruns...")
-            
-            # Get the latest run from the default experiment
-            client = mlflow.tracking.MlflowClient()
-            experiment = client.get_experiment_by_name("iris-classification")
-            
-            if experiment:
-                runs = client.search_runs(
-                    experiment_ids=[experiment.experiment_id],
-                    order_by=["start_time DESC"],
-                    max_results=1
-                )
-                
-                if runs:
-                    run = runs[0]
-                    model_uri = f"runs:/{run.info.run_id}/model"
-                    model = mlflow.sklearn.load_model(model_uri)
-                    model_info = {
-                        "source": "mlflow_local",
-                        "run_id": run.info.run_id,
-                        "experiment_id": experiment.experiment_id
-                    }
-                    logger.info(f"✓ Model loaded from local run: {run.info.run_id}")
-                    return True
-            
-            # Final fallback: Train a simple model
-            logger.warning("No model found in MLflow, training a default model...")
-            return load_default_model()
-            
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        return load_default_model()
-
-
 def load_default_model():
     """Train and load a simple default model as fallback"""
     global model, model_info
@@ -151,10 +86,72 @@ def load_default_model():
         return False
 
 
+def load_model_from_mlflow():
+    """Load model from MLflow registry or use default model"""
+    global model, model_info
+    
+    try:
+        import mlflow.sklearn
+        
+        # Try to load from MLflow registry
+        mlflow_tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+        if mlflow_tracking_uri:
+            mlflow.set_tracking_uri(mlflow_tracking_uri)
+            logger.info(f"MLflow tracking URI: {mlflow_tracking_uri}")
+        
+        model_name = os.getenv("MODEL_NAME", "iris-classifier")
+        model_stage = os.getenv("MODEL_STAGE", "Production")
+        
+        logger.info(f"Attempting to load model '{model_name}' from stage '{model_stage}'")
+        
+        try:
+            # Try with alias first (new way)
+            model_uri = f"models:/{model_name}@champion"
+            logger.info(f"Trying to load with alias: {model_uri}")
+            model = mlflow.sklearn.load_model(model_uri)
+            model_info = {
+                "source": "mlflow_alias",
+                "model_name": model_name,
+                "alias": "champion"
+            }
+            logger.info(f"✓ Model loaded from MLflow with alias 'champion'")
+            return True
+        except Exception as alias_error:
+            logger.warning(f"Could not load with alias: {alias_error}")
+            
+            # Fallback to stage (old way)
+            try:
+                model_uri = f"models:/{model_name}/{model_stage}"
+                logger.info(f"Trying to load with stage: {model_uri}")
+                model = mlflow.sklearn.load_model(model_uri)
+                model_info = {
+                    "source": "mlflow_stage",
+                    "model_name": model_name,
+                    "stage": model_stage
+                }
+                logger.info(f"✓ Model loaded from MLflow stage '{model_stage}'")
+                return True
+            except Exception as stage_error:
+                logger.warning(f"Could not load from MLflow stage: {stage_error}")
+                raise
+        
+    except Exception as e:
+        logger.warning(f"Could not load from MLflow: {e}")
+        logger.info("Falling back to default model...")
+        return load_default_model()
+
+
 @app.on_event("startup")
 async def startup_event():
     """Load model on application startup"""
     logger.info("Starting IRIS Classification API...")
+    logger.info(f"Python version: {os.sys.version}")
+    logger.info(f"Environment variables:")
+    logger.info(f"  PORT: {os.getenv('PORT', '8080')}")
+    logger.info(f"  MODEL_NAME: {os.getenv('MODEL_NAME', 'iris-classifier')}")
+    logger.info(f"  MODEL_STAGE: {os.getenv('MODEL_STAGE', 'Production')}")
+    logger.info(f"  MLFLOW_TRACKING_URI: {os.getenv('MLFLOW_TRACKING_URI', 'not set')}")
+    
     success = load_model_from_mlflow()
     
     if not success:
@@ -169,6 +166,7 @@ async def root():
     return {
         "message": "IRIS Classification API",
         "version": "1.0.0",
+        "model_loaded": model is not None,
         "endpoints": {
             "health": "/health",
             "predict": "/predict (POST)",

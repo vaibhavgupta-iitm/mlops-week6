@@ -240,7 +240,32 @@ jobs:
     - name: Wait for deployment rollout
       run: |
         echo "⏳ Waiting for deployment to complete..."
-        kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=10m
+        
+        # Check current pod status first
+        echo "Current pod status:"
+        kubectl get pods -l app=iris-api
+        
+        # Wait for rollout with better error handling
+        if ! kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=10m; then
+          echo "❌ Deployment rollout failed or timed out"
+          echo ""
+          echo "📊 Deployment status:"
+          kubectl get deployment ${{ env.DEPLOYMENT_NAME }}
+          echo ""
+          echo "📦 Pod status:"
+          kubectl get pods -l app=iris-api
+          echo ""
+          echo "🔍 Pod details:"
+          kubectl describe pods -l app=iris-api
+          echo ""
+          echo "📋 Recent pod logs:"
+          for pod in $(kubectl get pods -l app=iris-api -o jsonpath='{.items[*].metadata.name}'); do
+            echo "=== Logs for $pod ==="
+            kubectl logs $pod --tail=50 || echo "Could not fetch logs for $pod"
+            echo ""
+          done
+          exit 1
+        fi
         
         echo "✓ Deployment completed successfully"
     
