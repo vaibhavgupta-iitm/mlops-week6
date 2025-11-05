@@ -20,6 +20,9 @@ on:
           - production
           - staging
 
+  pull_request:
+    branches: [ main ]
+
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GKE_CLUSTER: iris-api-cluster
