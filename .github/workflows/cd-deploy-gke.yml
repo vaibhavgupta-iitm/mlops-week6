@@ -19,8 +19,6 @@ on:
         options:
           - production
           - staging
-  pull_request:
-    branches: [ main ]
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -35,9 +33,6 @@ jobs:
   build-and-push:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    
-    outputs:
-      full_image: ${{ steps.build_info.outputs.full_image }}
     
     steps:
     - name: Checkout code
@@ -75,11 +70,8 @@ jobs:
         IMAGE_URL="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}"
         FULL_IMAGE="${IMAGE_URL}:${IMAGE_TAG}"
         
-        # Set output
-        echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
-        
-        # Also save to file for use in later steps
-        echo "${FULL_IMAGE}" > /tmp/full_image.txt
+        # Save to file for artifact upload
+        echo "${FULL_IMAGE}" > full_image.txt
         
         echo "📦 Full Image: ${FULL_IMAGE}"
         echo "📦 Image URL: ${IMAGE_URL}"
@@ -87,7 +79,7 @@ jobs:
     
     - name: Build Docker image
       run: |
-        FULL_IMAGE=$(cat /tmp/full_image.txt)
+        FULL_IMAGE=$(cat full_image.txt)
         IMAGE_URL=$(echo ${FULL_IMAGE} | cut -d: -f1)
         
         echo "Building image: ${FULL_IMAGE}"
@@ -106,7 +98,7 @@ jobs:
     
     - name: Test Docker image
       run: |
-        FULL_IMAGE=$(cat /tmp/full_image.txt)
+        FULL_IMAGE=$(cat full_image.txt)
         echo "🧪 Testing Docker image: ${FULL_IMAGE}"
         
         docker run -d --name test-container -p 8080:8080 ${FULL_IMAGE}
@@ -124,7 +116,7 @@ jobs:
     
     - name: Push Docker image to Artifact Registry
       run: |
-        FULL_IMAGE=$(cat /tmp/full_image.txt)
+        FULL_IMAGE=$(cat full_image.txt)
         IMAGE_URL=$(echo ${FULL_IMAGE} | cut -d: -f1)
         
         echo "Pushing image: ${FULL_IMAGE}"
@@ -134,6 +126,13 @@ jobs:
         
         echo "✓ Image pushed to Artifact Registry"
         echo "📦 Full Image: ${FULL_IMAGE}"
+    
+    - name: Upload image info as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: image-info
+        path: full_image.txt
+        retention-days: 1
 
 
   deploy-to-gke:
@@ -145,15 +144,28 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Debug job outputs
+    - name: Download image info artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: image-info
+    
+    - name: Load image information
+      id: load_image
       run: |
-        echo "📦 Received from build job:"
-        echo "  full_image: ${{ needs.build-and-push.outputs.full_image }}"
-        
-        if [ -z "${{ needs.build-and-push.outputs.full_image }}" ]; then
-          echo "❌ ERROR: full_image is empty!"
+        if [ ! -f full_image.txt ]; then
+          echo "❌ ERROR: full_image.txt not found!"
           exit 1
         fi
+        
+        FULL_IMAGE=$(cat full_image.txt)
+        
+        if [ -z "$FULL_IMAGE" ]; then
+          echo "❌ ERROR: FULL_IMAGE is empty!"
+          exit 1
+        fi
+        
+        echo "📦 Loaded image: ${FULL_IMAGE}"
+        echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
     
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v1
@@ -203,7 +215,7 @@ jobs:
     
     - name: Update Kubernetes manifests
       run: |
-        FULL_IMAGE="${{ needs.build-and-push.outputs.full_image }}"
+        FULL_IMAGE=$(cat full_image.txt)
         
         echo "Updating deployment.yaml with image: ${FULL_IMAGE}"
         sed -i "s|REGION-docker.pkg.dev/PROJECT_ID/iris-api/iris-classifier:TAG|${FULL_IMAGE}|g" kubernetes/deployment.yaml
@@ -310,11 +322,13 @@ jobs:
     
     - name: Generate deployment report
       run: |
+        FULL_IMAGE=$(cat full_image.txt)
+        
         cat > deployment-report.md << EOF
         ## 🚀 Deployment Report
         
         ### 📦 Image Information
-        - **Image**: \`${{ needs.build-and-push.outputs.full_image }}\`
+        - **Image**: \`${FULL_IMAGE}\`
         - **Commit**: \`${{ github.sha }}\`
         - **Branch**: \`${{ github.ref_name }}\`
         - **Build Time**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
