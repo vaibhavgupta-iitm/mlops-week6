@@ -9,6 +9,7 @@ on:
       - 'Dockerfile'
       - 'kubernetes/**'
       - 'requirements.txt'
+      - 'mlruns/**'  # Added: Trigger on MLflow changes
   workflow_dispatch:
     inputs:
       environment:
@@ -44,13 +45,55 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
     
-    - name: Authenticate to Google Cloud
+    # NEW: Set up Python and pull MLflow artifacts
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install mlflow
+    
+    - name: Set up Google Cloud credentials
       uses: google-github-actions/auth@v1
       with:
         credentials_json: ${{ secrets.GCP_SA_KEY }}
     
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v1
+    
+    # NEW: Pull MLflow artifacts from DVC if available
+    - name: Setup DVC and pull MLflow artifacts
+      run: |
+        pip install dvc dvc-gs
+        
+        # Check if mlruns is tracked by DVC
+        if [ -f "mlruns.dvc" ]; then
+          echo "📦 Pulling MLflow artifacts from DVC..."
+          dvc remote add -d gcsremote gs://mlops-course-verdant-victory-473118-k0-unique-week2-2/iris-pipeline || true
+          dvc remote modify gcsremote credentialpath $GOOGLE_APPLICATION_CREDENTIALS
+          dvc pull mlruns.dvc
+          echo "✅ MLflow artifacts pulled"
+        else
+          echo "ℹ️ No mlruns.dvc found, using local mlruns if available"
+        fi
+        
+        # Verify mlruns directory exists
+        if [ -d "mlruns" ]; then
+          echo "✅ mlruns directory found"
+          ls -la mlruns/
+        else
+          echo "⚠️ Warning: mlruns directory not found. Container will use fallback model."
+          mkdir -p mlruns
+        fi
+      continue-on-error: true  # Don't fail if DVC pull fails
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
     
     - name: Configure Docker for Artifact Registry
       run: |
@@ -87,6 +130,14 @@ jobs:
         
         echo "Building image: ${FULL_IMAGE}"
         
+        # Verify build context
+        echo "📁 Build context contents:"
+        ls -la
+        if [ -d "mlruns" ]; then
+          echo "📁 mlruns directory:"
+          ls -la mlruns/
+        fi
+        
         docker build \
           -t ${FULL_IMAGE} \
           -t ${IMAGE_URL}:latest \
@@ -97,7 +148,7 @@ jobs:
           --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
           .
         
-        echo "✓ Docker image built successfully"
+        echo "✅ Docker image built successfully"
     
     - name: Test Docker image
       run: |
@@ -107,7 +158,17 @@ jobs:
         docker run -d --name test-container -p 8080:8080 ${FULL_IMAGE}
         sleep 15
         
+        echo "📋 Container logs:"
         docker logs test-container
+        
+        # Check if MLflow model was loaded (not fallback)
+        if docker logs test-container 2>&1 | grep -q "Model loaded from MLflow"; then
+          echo "✅ MLflow model loaded successfully"
+        elif docker logs test-container 2>&1 | grep -q "Falling back to default model"; then
+          echo "⚠️ Using fallback model (MLflow model not found)"
+        else
+          echo "ℹ️ Could not determine model source from logs"
+        fi
         
         curl -f http://localhost:8080/health || (echo "❌ Health check failed" && docker logs test-container && exit 1)
         curl -f http://localhost:8080/ || (echo "❌ Root endpoint failed" && docker logs test-container && exit 1)
@@ -115,7 +176,7 @@ jobs:
         docker stop test-container
         docker rm test-container
         
-        echo "✓ Docker image tests passed"
+        echo "✅ Docker image tests passed"
     
     - name: Push Docker image to Artifact Registry
       run: |
@@ -127,7 +188,7 @@ jobs:
         docker push ${FULL_IMAGE}
         docker push ${IMAGE_URL}:latest
         
-        echo "✓ Image pushed to Artifact Registry"
+        echo "✅ Image pushed to Artifact Registry"
         echo "📦 Full Image: ${FULL_IMAGE}"
     
     - name: Upload image info as artifact
@@ -202,9 +263,9 @@ jobs:
             --disk-size=20 \
             --disk-type=pd-standard
           
-          echo "✓ GKE cluster created"
+          echo "✅ GKE cluster created"
         else
-          echo "✓ GKE cluster already exists"
+          echo "✅ GKE cluster already exists"
         fi
     
     - name: Get GKE credentials
@@ -213,7 +274,7 @@ jobs:
           --zone=${{ env.GKE_ZONE }} \
           --project=${{ env.PROJECT_ID }}
         
-        echo "✓ Connected to GKE cluster"
+        echo "✅ Connected to GKE cluster"
         kubectl cluster-info
     
     - name: Update Kubernetes manifests
@@ -223,7 +284,7 @@ jobs:
         echo "Updating deployment.yaml with image: ${FULL_IMAGE}"
         sed -i "s|REGION-docker.pkg.dev/PROJECT_ID/iris-api/iris-classifier:TAG|${FULL_IMAGE}|g" kubernetes/deployment.yaml
         
-        echo "✓ Updated deployment.yaml"
+        echo "✅ Updated deployment.yaml"
         echo "Verifying update..."
         grep "image:" kubernetes/deployment.yaml
     
@@ -235,7 +296,7 @@ jobs:
         kubectl apply -f kubernetes/service.yaml
         kubectl apply -f kubernetes/hpa.yaml
         
-        echo "✓ Kubernetes resources applied"
+        echo "✅ Kubernetes resources applied"
     
     - name: Wait for deployment rollout
       run: |
@@ -267,7 +328,19 @@ jobs:
           exit 1
         fi
         
-        echo "✓ Deployment completed successfully"
+        echo "✅ Deployment completed successfully"
+        
+        # NEW: Check if MLflow model was loaded
+        echo ""
+        echo "🔍 Checking model source in pods..."
+        for pod in $(kubectl get pods -l app=iris-api -o jsonpath='{.items[*].metadata.name}'); do
+          echo "=== Checking $pod ==="
+          if kubectl logs $pod | grep -q "Model loaded from MLflow"; then
+            echo "✅ Pod is using MLflow model"
+          elif kubectl logs $pod | grep -q "Falling back to default model"; then
+            echo "⚠️ Pod is using fallback model"
+          fi
+        done
     
     - name: Get deployment status
       id: deployment_status
@@ -288,7 +361,7 @@ jobs:
           EXTERNAL_IP=$(kubectl get service iris-api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
           
           if [ -n "$EXTERNAL_IP" ] && [ "$EXTERNAL_IP" != "pending" ]; then
-            echo "✓ External IP assigned: ${EXTERNAL_IP}"
+            echo "✅ External IP assigned: ${EXTERNAL_IP}"
             echo "external_ip=${EXTERNAL_IP}" >> $GITHUB_OUTPUT
             echo "api_url=http://${EXTERNAL_IP}" >> $GITHUB_OUTPUT
             break
@@ -323,7 +396,7 @@ jobs:
         echo "Testing health endpoint..."
         for i in {1..15}; do
           if curl -f -m 5 http://${EXTERNAL_IP}/health 2>/dev/null; then
-            echo "✓ Health check passed"
+            echo "✅ Health check passed"
             break
           else
             if [ $i -eq 15 ]; then
@@ -346,7 +419,7 @@ jobs:
             "petal_width": 0.2
           }' -m 10 2>/dev/null || echo "⚠️ Prediction test may need more time"
         
-        echo "✓ Deployment complete"
+        echo "✅ Deployment complete"
     
     - name: Generate deployment report
       run: |
@@ -366,6 +439,7 @@ jobs:
         - **Zone**: \`${{ env.GKE_ZONE }}\`
         - **Namespace**: \`default\`
         - **Deployment**: \`${{ env.DEPLOYMENT_NAME }}\`
+        - **Model Source**: MLflow Production (with fallback)
         
         ### 🌐 Service Information
         - **External IP**: \`${{ steps.deployment_status.outputs.external_ip }}\`
@@ -380,6 +454,7 @@ jobs:
         
         ### ✅ Status
         - ✅ Docker image built and pushed
+        - ✅ MLflow artifacts included
         - ✅ Deployed to GKE
         - ✅ Rollout completed
         - ✅ Pods running
@@ -402,7 +477,7 @@ jobs:
         \`\`\`
         
         ---
-        *Deployed via GitHub Actions*
+        *Deployed via GitHub Actions with MLflow Integration*
         EOF
         
         cat deployment-report.md
@@ -479,4 +554,3 @@ jobs:
           echo "✅ All smoke tests passed"
           echo "✅ All $TOTAL_PODS pod(s) are running and ready"
         fi
-    

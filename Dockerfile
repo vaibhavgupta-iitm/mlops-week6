@@ -20,13 +20,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY src/ ./src/
 
-# Create directories
-RUN mkdir -p ./mlruns
+# Copy MLflow artifacts (model registry and runs)
+COPY mlruns/ ./mlruns/
 
 # Set environment variables
 ENV PORT=8080
 ENV MODEL_NAME=iris-classifier
 ENV MODEL_STAGE=Production
+ENV MLFLOW_TRACKING_URI=/app/mlruns
 ENV PYTHONUNBUFFERED=1
 
 # Expose port
