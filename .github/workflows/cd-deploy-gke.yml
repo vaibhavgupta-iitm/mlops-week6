@@ -441,34 +441,42 @@ jobs:
           --zone=${{ env.GKE_ZONE }} \
           --project=${{ env.PROJECT_ID }}
     
-    - name: Run smoke tests
-      run: |
-        echo "🧪 Running smoke tests..."
-        
-        # Check deployment exists
-        kubectl get deployment ${{ env.DEPLOYMENT_NAME }}
-        
-        # Check pods
-        RUNNING_PODS=$(kubectl get pods -l app=iris-api -o json | jq '.items | length')
-        echo "Total pods: $RUNNING_PODS"
-        
-        if [ "$RUNNING_PODS" -lt 1 ]; then
-          echo "❌ No pods running"
-          kubectl get pods -l app=iris-api
-          kubectl describe pods -l app=iris-api
-          exit 1
-        fi
-        
-        # Check ready pods
-        READY_PODS=$(kubectl get pods -l app=iris-api -o json | jq '[.items[] | select(.status.phase=="Running" and .status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length')
-        echo "Ready pods: $READY_PODS"
-        
-        if [ "$READY_PODS" -lt 1 ]; then
-          echo "⚠️ Not all pods are ready yet"
-          kubectl get pods -l app=iris-api
-          kubectl describe pods -l app=iris-api
-          echo "Note: Pods may still be initializing. Check manually if needed."
-        else
-          echo "✅ All smoke tests passed"
-          echo "✅ $READY_PODS pod(s) are running and healthy"
-        fi
+          - name: Run smoke tests
+          run: |
+            echo "🧪 Running smoke tests..."
+            
+            # Check deployment exists
+            kubectl get deployment ${{ env.DEPLOYMENT_NAME }}
+            
+            # Check pods
+            echo ""
+            echo "Pod status:"
+            kubectl get pods -l app=iris-api
+            
+            TOTAL_PODS=$(kubectl get pods -l app=iris-api --no-headers | wc -l)
+            echo "Total pods: $TOTAL_PODS"
+            
+            if [ "$TOTAL_PODS" -lt 1 ]; then
+              echo "❌ No pods found"
+              exit 1
+            fi
+            
+            # Check ready pods using simpler approach
+            READY_PODS=$(kubectl get pods -l app=iris-api --no-headers | grep -c "Running" || echo "0")
+            echo "Running pods: $READY_PODS"
+            
+            # Check if all pods have 1/1 or 2/2 ready containers
+            NOT_READY=$(kubectl get pods -l app=iris-api --no-headers | grep -v "1/1\|2/2" | wc -l || echo "0")
+            
+            if [ "$NOT_READY" -gt 0 ]; then
+              echo "⚠️ Some pods are not fully ready:"
+              kubectl get pods -l app=iris-api
+              echo ""
+              echo "Pod details:"
+              kubectl describe pods -l app=iris-api
+              echo ""
+              echo "Note: Pods may still be initializing. Check manually if needed."
+            else
+              echo "✅ All smoke tests passed"
+              echo "✅ All $TOTAL_PODS pod(s) are running and ready"
+            fi
