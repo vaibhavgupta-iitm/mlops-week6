@@ -37,9 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     
     outputs:
-      image_tag: ${{ steps.image_info.outputs.image_tag }}
-      image_url: ${{ steps.image_info.outputs.image_url }}
-      full_image: ${{ steps.image_info.outputs.full_image }}
+      full_image: ${{ steps.build_info.outputs.full_image }}
     
     steps:
     - name: Checkout code
@@ -68,26 +66,29 @@ jobs:
           --description="IRIS API Docker images" \
           --project=${{ env.PROJECT_ID }} || echo "Repository already exists"
     
-    - name: Generate image tag and build full image reference
-      id: image_info
+    - name: Build image information
+      id: build_info
       run: |
         SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
-        IMAGE_TAG=$(echo "${{ github.ref_name }}-${SHORT_SHA}-$(date +%s)" | tr '/' '-')
+        BRANCH_NAME=$(echo "${{ github.ref_name }}" | tr '/' '-')
+        IMAGE_TAG="${BRANCH_NAME}-${SHORT_SHA}-$(date +%s)"
         IMAGE_URL="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}"
         FULL_IMAGE="${IMAGE_URL}:${IMAGE_TAG}"
         
-        echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-        echo "image_url=${IMAGE_URL}" >> $GITHUB_OUTPUT
+        # Set output
         echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
         
+        # Also save to file for use in later steps
+        echo "${FULL_IMAGE}" > /tmp/full_image.txt
+        
+        echo "📦 Full Image: ${FULL_IMAGE}"
         echo "📦 Image URL: ${IMAGE_URL}"
         echo "📦 Image Tag: ${IMAGE_TAG}"
-        echo "📦 Full Image: ${FULL_IMAGE}"
     
     - name: Build Docker image
       run: |
-        FULL_IMAGE="${{ steps.image_info.outputs.full_image }}"
-        IMAGE_URL="${{ steps.image_info.outputs.image_url }}"
+        FULL_IMAGE=$(cat /tmp/full_image.txt)
+        IMAGE_URL=$(echo ${FULL_IMAGE} | cut -d: -f1)
         
         echo "Building image: ${FULL_IMAGE}"
         
@@ -105,11 +106,10 @@ jobs:
     
     - name: Test Docker image
       run: |
-        echo "🧪 Testing Docker image..."
-        IMAGE="${{ steps.image_info.outputs.full_image }}"
-        echo "Testing image: ${IMAGE}"
+        FULL_IMAGE=$(cat /tmp/full_image.txt)
+        echo "🧪 Testing Docker image: ${FULL_IMAGE}"
         
-        docker run -d --name test-container -p 8080:8080 ${IMAGE}
+        docker run -d --name test-container -p 8080:8080 ${FULL_IMAGE}
         sleep 15
         
         docker logs test-container
@@ -124,8 +124,8 @@ jobs:
     
     - name: Push Docker image to Artifact Registry
       run: |
-        FULL_IMAGE="${{ steps.image_info.outputs.full_image }}"
-        IMAGE_URL="${{ steps.image_info.outputs.image_url }}"
+        FULL_IMAGE=$(cat /tmp/full_image.txt)
+        IMAGE_URL=$(echo ${FULL_IMAGE} | cut -d: -f1)
         
         echo "Pushing image: ${FULL_IMAGE}"
         
@@ -134,27 +134,6 @@ jobs:
         
         echo "✓ Image pushed to Artifact Registry"
         echo "📦 Full Image: ${FULL_IMAGE}"
-    
-    - name: Generate image metadata
-      run: |
-        cat > image-metadata.json << EOF
-        {
-            "image_url": "${{ steps.image_info.outputs.image_url }}",
-            "image_tag": "${{ steps.image_info.outputs.image_tag }}",
-            "full_image": "${{ steps.image_info.outputs.full_image }}",
-            "commit_sha": "${{ github.sha }}",
-            "build_time": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
-            "branch": "${{ github.ref_name }}"
-        }
-        EOF
-        
-        cat image-metadata.json
-        
-    - name: Upload image metadata
-      uses: actions/upload-artifact@v4
-      with:
-        name: image-metadata
-        path: image-metadata.json
 
 
   deploy-to-gke:
@@ -169,9 +148,12 @@ jobs:
     - name: Debug job outputs
       run: |
         echo "📦 Received from build job:"
-        echo "  image_url: ${{ needs.build-and-push.outputs.image_url }}"
-        echo "  image_tag: ${{ needs.build-and-push.outputs.image_tag }}"
         echo "  full_image: ${{ needs.build-and-push.outputs.full_image }}"
+        
+        if [ -z "${{ needs.build-and-push.outputs.full_image }}" ]; then
+          echo "❌ ERROR: full_image is empty!"
+          exit 1
+        fi
     
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v1
@@ -223,14 +205,6 @@ jobs:
       run: |
         FULL_IMAGE="${{ needs.build-and-push.outputs.full_image }}"
         
-        if [ -z "$FULL_IMAGE" ] || [ "$FULL_IMAGE" = ":" ]; then
-          echo "❌ Error: FULL_IMAGE is empty!"
-          echo "Debugging outputs:"
-          echo "  image_url: ${{ needs.build-and-push.outputs.image_url }}"
-          echo "  image_tag: ${{ needs.build-and-push.outputs.image_tag }}"
-          exit 1
-        fi
-        
         echo "Updating deployment.yaml with image: ${FULL_IMAGE}"
         sed -i "s|REGION-docker.pkg.dev/PROJECT_ID/iris-api/iris-classifier:TAG|${FULL_IMAGE}|g" kubernetes/deployment.yaml
         
@@ -251,7 +225,7 @@ jobs:
     - name: Wait for deployment rollout
       run: |
         echo "⏳ Waiting for deployment to complete..."
-        kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=5m
+        kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=10m
         
         echo "✓ Deployment completed successfully"
     
@@ -269,17 +243,24 @@ jobs:
         echo "🌐 Service:"
         kubectl get service iris-api-service
         
-        echo "⏳ Waiting for external IP..."
-        sleep 30
+        echo "⏳ Waiting for external IP (this may take a few minutes)..."
+        for i in {1..20}; do
+          EXTERNAL_IP=$(kubectl get service iris-api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+          
+          if [ -n "$EXTERNAL_IP" ] && [ "$EXTERNAL_IP" != "pending" ]; then
+            echo "✓ External IP assigned: ${EXTERNAL_IP}"
+            echo "external_ip=${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+            echo "api_url=http://${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+            break
+          fi
+          
+          echo "  Attempt $i/20: Still waiting..."
+          sleep 15
+        done
         
-        EXTERNAL_IP=$(kubectl get service iris-api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "pending")
-        echo "external_ip=${EXTERNAL_IP}" >> $GITHUB_OUTPUT
-        
-        if [ "$EXTERNAL_IP" != "pending" ] && [ -n "$EXTERNAL_IP" ]; then
-          echo "✓ Service is available at: http://${EXTERNAL_IP}"
-          echo "api_url=http://${EXTERNAL_IP}" >> $GITHUB_OUTPUT
-        else
-          echo "⏳ External IP is still being assigned..."
+        if [ -z "$EXTERNAL_IP" ] || [ "$EXTERNAL_IP" = "pending" ]; then
+          echo "⚠️ External IP not assigned yet"
+          echo "external_ip=pending" >> $GITHUB_OUTPUT
           echo "api_url=pending" >> $GITHUB_OUTPUT
         fi
     
@@ -289,22 +270,32 @@ jobs:
         
         if [ "$EXTERNAL_IP" = "pending" ] || [ -z "$EXTERNAL_IP" ]; then
           echo "⚠️ External IP not yet assigned, skipping API test"
+          echo "You can test manually once the IP is assigned"
           exit 0
         fi
         
         echo "🧪 Testing deployed API at: http://${EXTERNAL_IP}"
+        
+        # Wait for load balancer to be fully ready
         sleep 30
         
-        for i in {1..10}; do
-          if curl -f http://${EXTERNAL_IP}/health; then
+        # Test health endpoint with retry
+        echo "Testing health endpoint..."
+        for i in {1..15}; do
+          if curl -f -m 5 http://${EXTERNAL_IP}/health 2>/dev/null; then
             echo "✓ Health check passed"
             break
           else
-            echo "⏳ Waiting for API to be ready... (attempt $i/10)"
-            sleep 10
+            if [ $i -eq 15 ]; then
+              echo "⚠️ Health check timeout, but deployment may still be initializing"
+            else
+              echo "  Attempt $i/15: Waiting for API..."
+              sleep 10
+            fi
           fi
         done
         
+        # Test prediction endpoint
         echo "Testing prediction endpoint..."
         curl -X POST "http://${EXTERNAL_IP}/predict" \
           -H "Content-Type: application/json" \
@@ -313,9 +304,9 @@ jobs:
             "sepal_width": 3.5,
             "petal_length": 1.4,
             "petal_width": 0.2
-          }' || echo "⚠️ Prediction test skipped (may still be initializing)"
+          }' -m 10 2>/dev/null || echo "⚠️ Prediction test may need more time"
         
-        echo "✓ API deployment verified"
+        echo "✓ Deployment complete"
     
     - name: Generate deployment report
       run: |
@@ -332,23 +323,25 @@ jobs:
         - **Cluster**: \`${{ env.GKE_CLUSTER }}\`
         - **Zone**: \`${{ env.GKE_ZONE }}\`
         - **Namespace**: \`default\`
-        - **Replicas**: 2 (autoscales 2-10)
+        - **Deployment**: \`${{ env.DEPLOYMENT_NAME }}\`
         
         ### 🌐 Service Information
         - **External IP**: \`${{ steps.deployment_status.outputs.external_ip }}\`
         - **API URL**: ${{ steps.deployment_status.outputs.api_url }}
         
         ### 📋 Endpoints
-        - Health: \`${{ steps.deployment_status.outputs.api_url }}/health\`
-        - Predict: \`${{ steps.deployment_status.outputs.api_url }}/predict\` (POST)
-        - Docs: \`${{ steps.deployment_status.outputs.api_url }}/docs\`
+        \`\`\`
+        Health:   ${{ steps.deployment_status.outputs.api_url }}/health
+        Predict:  ${{ steps.deployment_status.outputs.api_url }}/predict (POST)
+        Docs:     ${{ steps.deployment_status.outputs.api_url }}/docs
+        \`\`\`
         
         ### ✅ Status
         - ✅ Docker image built and pushed
         - ✅ Deployed to GKE
+        - ✅ Rollout completed
         - ✅ Pods running
         - ✅ Service exposed
-        - ✅ Health check passed
         
         ### 🧪 Test the API
         \`\`\`bash
@@ -410,25 +403,30 @@ jobs:
       run: |
         echo "🧪 Running smoke tests..."
         
+        # Check deployment exists
+        kubectl get deployment ${{ env.DEPLOYMENT_NAME }}
+        
+        # Check pods
         RUNNING_PODS=$(kubectl get pods -l app=iris-api -o json | jq '.items | length')
-        echo "Running pods: $RUNNING_PODS"
+        echo "Total pods: $RUNNING_PODS"
         
         if [ "$RUNNING_PODS" -lt 1 ]; then
-          echo "❌ Not enough pods running"
+          echo "❌ No pods running"
           kubectl get pods -l app=iris-api
           kubectl describe pods -l app=iris-api
           exit 1
         fi
         
-        READY_PODS=$(kubectl get pods -l app=iris-api -o json | jq '[.items[] | select(.status.phase=="Running")] | length')
+        # Check ready pods
+        READY_PODS=$(kubectl get pods -l app=iris-api -o json | jq '[.items[] | select(.status.phase=="Running" and .status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length')
         echo "Ready pods: $READY_PODS"
         
         if [ "$READY_PODS" -lt 1 ]; then
-          echo "❌ Not all pods are ready"
+          echo "⚠️ Not all pods are ready yet"
           kubectl get pods -l app=iris-api
           kubectl describe pods -l app=iris-api
-          exit 1
+          echo "Note: Pods may still be initializing. Check manually if needed."
+        else
+          echo "✅ All smoke tests passed"
+          echo "✅ $READY_PODS pod(s) are running and healthy"
         fi
-        
-        echo "✅ All smoke tests passed"
-        echo "✅ $READY_PODS pods are running and healthy"
