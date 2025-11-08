@@ -3,7 +3,7 @@ name: CI/CD - Production Pipeline
 on:
   pull_request:
     branches: [ main ]
-  workflow_dispatch:  # Allow manual triggers
+  workflow_dispatch: 
 
 permissions:
   contents: write
