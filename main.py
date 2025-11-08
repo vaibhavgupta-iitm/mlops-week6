@@ -69,11 +69,11 @@ def main():
     parser.add_argument('--promote-to-production', action='store_true',
                        help='Promote the trained model to Production stage')
     
-    parser.add_argument('--from-alias', type=str, required=True,
+    parser.add_argument('--from-alias', type=str,
                        help='Alias to promote from (e.g., dev)')
-    parser.add_argument('--to-alias', type=str, required=True,
+    parser.add_argument('--to-alias', type=str,
                        help='Alias to promote to (e.g., stg)')
-    parser.add_argument('--model-name', type=str, required=True,
+    parser.add_argument('--model-name', type=str,
                        help='Name of the registered model')
     parser.add_argument('--promote-model-alias', action='store_true',
                        help='Promote model alias in MLflow Model Registry')
