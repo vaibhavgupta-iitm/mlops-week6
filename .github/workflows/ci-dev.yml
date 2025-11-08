@@ -110,7 +110,7 @@ jobs:
           
           # --- THIS IS THE NEW PART ---
           echo "🚀 Promoting model from @dev to @stg..."
-          python promote_model.py \
+          python main.py \
             --promote-model-alias \
             --model-name "iris-classifier" \
             --from-alias "dev" \
