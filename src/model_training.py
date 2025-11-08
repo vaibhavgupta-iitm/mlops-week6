@@ -15,6 +15,7 @@ import logging
 import numpy as np
 import pandas as pd
 from mlflow.models import infer_signature
+from mlflow.tracking import MlflowClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +45,12 @@ class ModelTrainer:
         self.best_params = None
         self.current_run_id = None  # Store the run_id where model was logged
         self.registered_model_version = None  # Store the registered version
+
+        self.mlflow_tracking_uri = mlflow_tracking_uri # Store this
+        
+        # Setup MLflow
+        if self.mlflow_tracking_uri:
+            mlflow.set_tracking_uri(self.mlflow_tracking_uri)
         
         # Setup MLflow
         if mlflow_tracking_uri:
@@ -54,6 +61,7 @@ class ModelTrainer:
     def train_model(self, X_train, y_train, log_to_mlflow: bool = True) -> DecisionTreeClassifier:
         """
         Train the decision tree model with single hyperparameter set.
+        Logs to the ACTIVE MLflow run (assumes a run is already started).
         
         Args:
             X_train: Training features
@@ -69,13 +77,17 @@ class ModelTrainer:
                 'random_state': self.random_state
             }
             
+            # Train the model regardless of logging
+            self.model = DecisionTreeClassifier(**params)
+            self.model.fit(X_train, y_train)
+            
             if log_to_mlflow:
-                with mlflow.start_run(run_name="single_model_training") as run:
-                    self.current_run_id = run.info.run_id
-                    logger.info(f"Training in MLflow run: {self.current_run_id}")
-                    
-                    self.model = DecisionTreeClassifier(**params)
-                    self.model.fit(X_train, y_train)
+                # We assume a run is already active!
+                active_run = mlflow.active_run()
+                if active_run is None:
+                    logger.warning("No active MLflow run found. Model will be trained but not logged.")
+                else:
+                    logger.info(f"Logging model and parameters to active MLflow run: {active_run.info.run_id}")
                     
                     # Log parameters
                     mlflow.log_params(params)
@@ -96,10 +108,7 @@ class ModelTrainer:
                         signature=signature
                     )
                     
-                    logger.info(f"Model logged to MLflow in run {self.current_run_id}")
-            else:
-                self.model = DecisionTreeClassifier(**params)
-                self.model.fit(X_train, y_train)
+                    logger.info("Model logged to MLflow")
             
             logger.info("Model training completed successfully")
             return self.model
@@ -115,6 +124,7 @@ class ModelTrainer:
                                          cv: int = 5) -> DecisionTreeClassifier:
         """
         Train model with hyperparameter tuning using GridSearchCV.
+        Logs to the ACTIVE MLflow run (assumes a run is already started).
         
         Args:
             X_train: Training features
@@ -134,66 +144,69 @@ class ModelTrainer:
             }
         
         try:
-            with mlflow.start_run(run_name="hyperparameter_tuning") as run:
-                self.current_run_id = run.info.run_id
-                logger.info(f"Hyperparameter tuning in MLflow run: {self.current_run_id}")
-                
-                # Log the parameter grid being searched
-                mlflow.log_param("param_grid", str(param_grid))
-                mlflow.log_param("cv_folds", cv)
-                mlflow.log_param("random_state", self.random_state)
-                
-                # Perform grid search
-                base_model = DecisionTreeClassifier(random_state=self.random_state)
-                grid_search = GridSearchCV(
-                    base_model,
-                    param_grid,
-                    cv=cv,
-                    scoring='accuracy',
-                    n_jobs=-1,
-                    verbose=1
-                )
-                
-                logger.info("Starting hyperparameter tuning...")
-                grid_search.fit(X_train, y_train)
-                
-                # Store best model and parameters
-                self.model = grid_search.best_estimator_
-                self.best_params = grid_search.best_params_
-                
-                # Log best parameters
-                mlflow.log_params({f"best_{k}": v for k, v in self.best_params.items()})
-                
-                # Log cross-validation results
-                mlflow.log_metric("best_cv_score", grid_search.best_score_)
-                mlflow.log_metric("train_accuracy", self.model.score(X_train, y_train))
-                
-                # Log all CV results
-                cv_results = grid_search.cv_results_
-                for i in range(len(cv_results['params'])):
-                    with mlflow.start_run(nested=True, run_name=f"cv_fold_{i}"):
-                        mlflow.log_params(cv_results['params'][i])
-                        mlflow.log_metric("mean_test_score", cv_results['mean_test_score'][i])
-                        mlflow.log_metric("std_test_score", cv_results['std_test_score'][i])
-                
-                # Log the best model
-                input_example = X_train.iloc[:5] if isinstance(X_train, pd.DataFrame) else None
-                signature = infer_signature(X_train, y_train)
+            # We assume a run is already active!
+            active_run = mlflow.active_run()
+            if active_run is None:
+                raise RuntimeError("No active MLflow run found. Cannot proceed with hyperparameter tuning logging.")
+            
+            logger.info(f"Hyperparameter tuning in active MLflow run: {active_run.info.run_id}")
+            
+            # Log the parameter grid being searched
+            mlflow.log_param("param_grid", str(param_grid))
+            mlflow.log_param("cv_folds", cv)
+            mlflow.log_param("random_state", self.random_state)
+            
+            # Perform grid search
+            base_model = DecisionTreeClassifier(random_state=self.random_state)
+            grid_search = GridSearchCV(
+                base_model,
+                param_grid,
+                cv=cv,
+                scoring='accuracy',
+                n_jobs=-1,
+                verbose=1
+            )
+            
+            logger.info("Starting hyperparameter tuning...")
+            grid_search.fit(X_train, y_train)
+            
+            # Store best model and parameters
+            self.model = grid_search.best_estimator_
+            self.best_params = grid_search.best_params_
+            
+            # Log best parameters
+            mlflow.log_params({f"best_{k}": v for k, v in self.best_params.items()})
+            
+            # Log cross-validation results
+            mlflow.log_metric("best_cv_score", grid_search.best_score_)
+            mlflow.log_metric("train_accuracy", self.model.score(X_train, y_train))
+            
+            # Log all CV results
+            cv_results = grid_search.cv_results_
+            for i in range(len(cv_results['params'])):
+                with mlflow.start_run(nested=True, run_name=f"cv_fold_{i}"):
+                    mlflow.log_params(cv_results['params'][i])
+                    mlflow.log_metric("mean_test_score", cv_results['mean_test_score'][i])
+                    mlflow.log_metric("std_test_score", cv_results['std_test_score'][i])
+            
+            # Log the best model
+            input_example = X_train.iloc[:5] if isinstance(X_train, pd.DataFrame) else None
+            signature = infer_signature(X_train, y_train)
 
-                mlflow.sklearn.log_model(
-                    sk_model=self.model,
-                    artifact_path="model",
-                    registered_model_name="iris-classifier",
-                    input_example=input_example,
-                    signature=signature
-                )
-                
-                logger.info(f"Hyperparameter tuning completed. Best params: {self.best_params}")
-                logger.info(f"Best CV score: {grid_search.best_score_:.4f}")
-                logger.info(f"Model logged to MLflow in run {self.current_run_id}")
-                
-                return self.model
-                
+            mlflow.sklearn.log_model(
+                sk_model=self.model,
+                artifact_path="model",
+                registered_model_name="iris-classifier",
+                input_example=input_example,
+                signature=signature
+            )
+            
+            logger.info(f"Hyperparameter tuning completed. Best params: {self.best_params}")
+            logger.info(f"Best CV score: {grid_search.best_score_:.4f}")
+            logger.info(f"Model logged to MLflow in run {active_run.info.run_id}")
+            
+            return self.model
+            
         except Exception as e:
             logger.error(f"Error during hyperparameter tuning: {e}")
             raise
@@ -278,8 +291,6 @@ class ModelTrainer:
     
     def load_model_from_mlflow(self, 
                                model_name: str = "iris-classifier",
-                               stage: str = "Production",
-                               version: Optional[int] = None,
                                alias: Optional[str] = None) -> DecisionTreeClassifier:
         """
         Load model from MLflow model registry.
@@ -296,12 +307,9 @@ class ModelTrainer:
         try:
             if alias:
                 model_uri = f"models:/{model_name}@{alias}"
+                print("model uri ::::", model_uri)
                 logger.info(f"Loading model with alias '{alias}' from MLflow registry")
-            elif version:
-                model_uri = f"models:/{model_name}/{version}"
-                logger.info(f"Loading model version {version} from MLflow registry")
             else:
-                # Try alias first (new way), fall back to stage (old way)
                 try:
                     model_uri = f"models:/{model_name}@champion"
                     logger.info(f"Attempting to load model with alias 'champion' from MLflow registry")
@@ -309,8 +317,7 @@ class ModelTrainer:
                     logger.info(f"Model loaded successfully from: {model_uri}")
                     return self.model
                 except:
-                    model_uri = f"models:/{model_name}/{stage}"
-                    logger.info(f"Falling back to stage '{stage}' from MLflow registry")
+                    logger.info(f"mdel with no annotation found in MLflow registry")
             
             self.model = mlflow.sklearn.load_model(model_uri)
             logger.info(f"Model loaded successfully from: {model_uri}")
@@ -318,148 +325,6 @@ class ModelTrainer:
             
         except Exception as e:
             logger.error(f"Error loading model from MLflow: {e}")
-            raise
-    
-    def get_best_model_from_experiment(self, 
-                                       experiment_name: str = "iris-classification",
-                                       metric: str = "test_accuracy") -> str:
-        """
-        Get the best model run ID based on a metric.
-        
-        Args:
-            experiment_name: Name of the MLflow experiment
-            metric: Metric to use for selecting best model
-            
-        Returns:
-            Run ID of the best model
-        """
-        try:
-            experiment = mlflow.get_experiment_by_name(experiment_name)
-            if experiment is None:
-                raise ValueError(f"Experiment '{experiment_name}' not found")
-            
-            # Search for runs with the metric
-            runs = mlflow.search_runs(
-                experiment_ids=[experiment.experiment_id],
-                filter_string="",
-                order_by=[f"metrics.{metric} DESC"],
-                max_results=1
-            )
-            
-            if runs.empty:
-                raise ValueError(f"No runs found with metric '{metric}'")
-            
-            best_run_id = runs.iloc[0]['run_id']
-            best_metric_value = runs.iloc[0][f'metrics.{metric}']
-            
-            logger.info(f"Best model run ID: {best_run_id} with {metric}: {best_metric_value:.4f}")
-            return best_run_id
-            
-        except Exception as e:
-            logger.error(f"Error getting best model: {e}")
-            raise
-    
-    def promote_model_to_production(self, 
-                                    model_name: str = "iris-classifier",
-                                    version: Optional[int] = None,
-                                    run_id: Optional[str] = None,
-                                    use_alias: bool = True):
-        """
-        Promote a model version to Production using aliases (new way) or stages (deprecated).
-        
-        Args:
-            model_name: Name of the registered model
-            version: Version number to promote
-            run_id: Run ID to promote (if version not provided)
-            use_alias: Use new alias system instead of deprecated stages
-        """
-        try:
-            from mlflow.tracking import MlflowClient
-            import time
-            
-            client = MlflowClient()
-            
-            if version is None and run_id:
-                # Find version from run_id with retry logic
-                logger.info(f"Looking for model version with run_id: {run_id}")
-                
-                max_retries = 10
-                retry_delay = 2  # seconds
-                
-                for attempt in range(max_retries):
-                    model_versions = client.search_model_versions(f"name='{model_name}'")
-                    
-                    logger.info(f"Found {len(model_versions)} total versions for {model_name}")
-                    
-                    for mv in model_versions:
-                        logger.info(f"  Checking version {mv.version}, run_id: {mv.run_id}")
-                        if mv.run_id == run_id:
-                            version = int(mv.version)
-                            logger.info(f"✓ Found model version {version} for run_id: {run_id}")
-                            break
-                    
-                    if version is not None:
-                        break
-                    
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Model version not found yet, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})")
-                        time.sleep(retry_delay)
-                
-                if version is None:
-                    # List all available versions for debugging
-                    logger.error(f"Available model versions for {model_name}:")
-                    for mv in model_versions:
-                        logger.error(f"  Version {mv.version}, Run ID: {mv.run_id}, Stage: {mv.current_stage}")
-                    raise ValueError(f"No model version found for run_id: {run_id} after {max_retries} attempts")
-            
-            if version is None:
-                raise ValueError("Either version or run_id must be provided")
-            
-            # Use aliases (new recommended way)
-            if use_alias:
-                logger.info(f"Setting alias 'champion' for model {model_name} version {version}...")
-                client.set_registered_model_alias(
-                    name=model_name,
-                    alias="champion",
-                    version=version
-                )
-                logger.info(f"✓ Model {model_name} version {version} promoted with alias 'champion'")
-            else:
-                # Use stages (deprecated but more compatible with file store)
-                logger.info(f"Transitioning model {model_name} version {version} to Production stage...")
-                
-                # Don't archive existing versions - this causes the YAML serialization error
-                client.transition_model_version_stage(
-                    name=model_name,
-                    version=version,
-                    stage="Production",
-                    archive_existing_versions=False  # Changed to False to avoid serialization issues
-                )
-                
-                logger.info(f"✓ Model {model_name} version {version} promoted to Production")
-            
-        except Exception as e:
-            logger.error(f"Error promoting model: {e}")
-            raise
-    
-    def save_model(self, model_path: str) -> None:
-        """
-        Save the trained model to disk (legacy support).
-        Note: With MLflow, prefer using MLflow model registry instead.
-        
-        Args:
-            model_path: Path where to save the model
-        """
-        if self.model is None:
-            raise ValueError("Model not trained yet. Call train_model first.")
-        
-        try:
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
-            joblib.dump(self.model, model_path)
-            logger.info(f"Model saved to: {model_path}")
-            logger.warning("Consider using MLflow model registry instead of local file storage")
-        except Exception as e:
-            logger.error(f"Error saving model: {e}")
             raise
     
     def save_metrics(self, metrics: Dict[str, Any], metrics_path: str) -> None:
@@ -488,4 +353,38 @@ class ModelTrainer:
             logger.info(f"Metrics saved to: {metrics_path}")
         except Exception as e:
             logger.error(f"Error saving metrics: {e}")
+            raise
+
+    def promote_model_alias(self, model_name: str, from_alias: str, to_alias: str):
+        """
+        Promotes a model by setting a new alias.
+        Finds the version number for 'from_alias' and applies 'to_alias' to it.
+        
+        Args:
+            model_name: Name of the registered model
+            from_alias: The alias to find (e.g., 'dev')
+            to_alias: The new alias to set (e.g., 'stg')
+        """
+        try:
+            client = MlflowClient(tracking_uri=self.mlflow_tracking_uri)
+            
+            logger.info(f"Attempting to promote model '{model_name}' from '@{from_alias}' to '@{to_alias}'...")
+            
+            # 1. Get the version number from the 'from_alias'
+            version_details = client.get_model_version_by_alias(name=model_name, alias=from_alias)
+            version_number = version_details.version
+            
+            logger.info(f"Found version '{version_number}' for alias '@{from_alias}'.")
+            
+            # 2. Set the new 'to_alias' on that specific version
+            client.set_registered_model_alias(
+                name=model_name,
+                version=version_number,
+                alias=to_alias
+            )
+            
+            logger.info(f"Successfully set alias '@{to_alias}' to version '{version_number}' of model '{model_name}'.")
+
+        except Exception as e:
+            logger.error(f"Error promoting model alias: {e}")
             raise

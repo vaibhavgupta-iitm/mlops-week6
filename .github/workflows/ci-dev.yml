@@ -65,29 +65,23 @@ jobs:
 
     
     - name: Train and evaluate model (or load from MLflow)
-      id: evaluate
       run: |
         echo "📊 Training/Evaluating model..."
         
-        # Try to load from MLflow registry, fallback to training if not available
+        # Try to load from MLflow registry
         if python main.py \
           --data-path iris-dvc-pipeline/v1_data.csv \
           --use-mlflow-model \
-          --model-stage Production \
-          --mlflow-tracking-uri "${MLFLOW_TRACKING_URI:-file:./mlruns}" \
+          --model-alias dev \
+          --mlflow-tracking-uri ${{ secrets.MLFLOW_TRACKING_URI }} \
           --metrics-path iris-dvc-pipeline/metrics.txt 2>/dev/null; then
-          echo "✓ Loaded model from MLflow Production stage"
-          echo "model_source=mlflow_production" >> $GITHUB_OUTPUT
+          echo "✓ Loaded model from MLflow alias: dev"
+          echo "model_source=mlflow_dev" >> $GITHUB_OUTPUT
         else
-          echo "⚠ No model in MLflow Production, training new model..."
-          python main.py \
-            --data-path iris-dvc-pipeline/v1_data.csv \
-            --hyperparameter-tuning \
-            --mlflow-tracking-uri "${MLFLOW_TRACKING_URI:-file:./mlruns}" \
-            --metrics-path iris-dvc-pipeline/metrics.txt
-          echo "model_source=newly_trained" >> $GITHUB_OUTPUT
+          echo "❌ No model found for alias 'dev'. Failing pipeline."
+          exit 1
         fi
-        
+    
         # Extract accuracy from metrics file
         if [ -f "iris-dvc-pipeline/metrics.txt" ]; then
           ACCURACY=$(grep "Accuracy:" iris-dvc-pipeline/metrics.txt | awk '{print $2}')
@@ -96,110 +90,40 @@ jobs:
           echo "Model F1 Score: $F1_SCORE"
           echo "accuracy=$ACCURACY" >> $GITHUB_OUTPUT
           echo "f1_score=$F1_SCORE" >> $GITHUB_OUTPUT
+        else
+          echo "⚠ Metrics file not found!"
+          exit 1
         fi
+      
     
-    - name: Check model performance threshold
+    - name: Check model performance threshold and promote model
+      id: performance_check # Give this step an ID
       run: |
-        ACCURACY=${{ steps.evaluate.outputs.accuracy }}
+        # Ensure outputs from the evaluate step are available
+        ACCURACY=$(grep "Accuracy:" iris-dvc-pipeline/metrics.txt | awk '{print $2}')
         THRESHOLD=${{ env.DEV_THRESHOLD }}
         
         echo "Checking if accuracy ($ACCURACY) >= threshold ($THRESHOLD)"
         
         if (( $(echo "$ACCURACY >= $THRESHOLD" | bc -l) )); then
           echo "✅ Model meets performance threshold ($ACCURACY >= $THRESHOLD)"
+          
+          # --- THIS IS THE NEW PART ---
+          echo "🚀 Promoting model from @dev to @stg..."
+          python promote_model.py \
+            --promote-model-alias \
+            --model-name "iris-classifier" \
+            --from-alias "dev" \
+            --to-alias "stg" \
+            --mlflow-tracking-uri ${{ secrets.MLFLOW_TRACKING_URI }}
+          
+          echo "promotion_status=promoted" >> $GITHUB_OUTPUT
+          
         else
           echo "❌ Model does not meet performance threshold ($ACCURACY < $THRESHOLD)"
+          echo "promotion_status=not_promoted" >> $GITHUB_OUTPUT
           exit 1
         fi
-    
-    - name: Promote best model to Staging (only on push to dev)
-      if: github.event_name == 'push' && steps.evaluate.outputs.model_source == 'newly_trained'
-      run: |
-        echo "🚀 Promoting best model to Staging stage..."
-        
-        python -c "
-        import mlflow
-        from mlflow.tracking import MlflowClient
-        
-        # Set tracking URI
-        mlflow.set_tracking_uri('${MLFLOW_TRACKING_URI:-file:./mlruns}')
-        client = MlflowClient()
-        
-        try:
-            # Get the experiment
-            experiment = client.get_experiment_by_name('iris-classification')
-            if not experiment:
-                print('❌ Experiment not found')
-                exit(1)
-            
-            # Get all runs from the experiment, sorted by accuracy
-            runs = client.search_runs(
-                experiment_ids=[experiment.experiment_id],
-                order_by=['metrics.test_accuracy DESC'],
-                max_results=1
-            )
-            
-            if not runs:
-                print('❌ No runs found in experiment')
-                exit(1)
-            
-            best_run = runs[0]
-            run_id = best_run.info.run_id
-            accuracy = best_run.data.metrics.get('test_accuracy', 0)
-            
-            print(f'📦 Best model run_id: {run_id}')
-            print(f'📊 Best model accuracy: {accuracy}')
-            
-            # Check if model is already registered
-            try:
-                registered_models = client.search_registered_models(
-                    filter_string=\"name='iris-classifier'\"
-                )
-                
-                if registered_models:
-                    print('ℹ Model already registered, creating new version...')
-                    # Register new version
-                    model_uri = f'runs:/{run_id}/model'
-                    mv = client.create_model_version(
-                        name='iris-classifier',
-                        source=model_uri,
-                        run_id=run_id
-                    )
-                    version = mv.version
-                else:
-                    print('ℹ Model not registered yet, will be registered by training script')
-                    # The model should have been registered during training
-                    # Get the latest version
-                    versions = client.get_latest_versions('iris-classifier')
-                    if versions:
-                        version = versions[0].version
-                    else:
-                        print('❌ Could not find registered model')
-                        exit(1)
-                
-                print(f'📌 Model version: {version}')
-                
-                # Transition to Staging
-                client.transition_model_version_stage(
-                    name='iris-classifier',
-                    version=version,
-                    stage='Staging',
-                    archive_existing_versions=False  # Keep old staging versions
-                )
-                
-                print(f'✅ Model version {version} promoted to Staging')
-                print(f'✅ Ready for production deployment!')
-                
-            except Exception as e:
-                print(f'⚠️ Error during model registration/promotion: {e}')
-                print('This might be expected if model was just registered')
-                
-        except Exception as e:
-            print(f'❌ Error promoting model: {e}')
-            import traceback
-            traceback.print_exc()
-            exit(1)
-        "
     
     - name: Setup CML
       uses: iterative/setup-cml@v1
