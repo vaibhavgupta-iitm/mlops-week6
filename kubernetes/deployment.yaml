@@ -37,6 +37,8 @@ spec:
           value: "Production"
         - name: PYTHONUNBUFFERED
           value: "1"
+        - name: GCP_PROJECT_ID
+          value: verdant-victory-473118-k0
         resources:
           requests:
             memory: "256Mi"
