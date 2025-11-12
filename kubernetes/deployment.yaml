@@ -47,7 +47,7 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
-        # Startup probe - gives app time to start (up to 5 minutes)
+
         startupProbe:
           httpGet:
             path: /health
