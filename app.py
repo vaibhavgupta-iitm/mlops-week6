@@ -1,7 +1,7 @@
 """
 FastAPI application for IRIS classification prediction.
 Loads model from MLflow and serves predictions via REST API.
-Enhanced with structured logging for Google Cloud Logging.
+Enhanced with structured logging and distributed tracing for Google Cloud.
 """
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,6 +14,9 @@ import json
 import time
 from datetime import datetime
 import os
+
+# Import tracing setup
+from src.tracing import setup_tracing, get_tracer
 
 # Configure structured logging for Google Cloud
 class StructuredLogger:
@@ -41,6 +44,14 @@ class StructuredLogger:
                     "timestamp": datetime.utcnow().isoformat() + "Z",
                     "component": record.name,
                 }
+                
+                # Add trace context if available
+                from opentelemetry import trace
+                span = trace.get_current_span()
+                if span.is_recording():
+                    span_context = span.get_span_context()
+                    log_obj['logging.googleapis.com/trace'] = f"projects/{os.getenv('GCP_PROJECT_ID', 'unknown')}/traces/{format(span_context.trace_id, '032x')}"
+                    log_obj['logging.googleapis.com/spanId'] = format(span_context.span_id, '016x')
                 
                 # Add extra fields if present
                 if hasattr(record, 'request_id'):
@@ -134,82 +145,91 @@ def load_default_model():
     """Train and load a simple default model as fallback"""
     global model, model_info
     
-    try:
-        from sklearn.tree import DecisionTreeClassifier
-        from sklearn.datasets import load_iris
-        
-        logger.info("Training default model...")
-        iris = load_iris()
-        model = DecisionTreeClassifier(max_depth=3, random_state=42)
-        model.fit(iris.data, iris.target)
-        
-        model_info = {
-            "source": "default_trained",
-            "note": "Fallback model trained on startup"
-        }
-        logger.info("Default model trained and loaded successfully")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to load default model: {str(e)}")
-        return False
+    tracer = get_tracer()
+    with tracer.start_as_current_span("load_default_model"):
+        try:
+            from sklearn.tree import DecisionTreeClassifier
+            from sklearn.datasets import load_iris
+            
+            logger.info("Training default model...")
+            iris = load_iris()
+            model = DecisionTreeClassifier(max_depth=3, random_state=42)
+            model.fit(iris.data, iris.target)
+            
+            model_info = {
+                "source": "default_trained",
+                "note": "Fallback model trained on startup"
+            }
+            logger.info("Default model trained and loaded successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to load default model: {str(e)}")
+            return False
 
 
 def load_model_from_mlflow():
     """Load model from MLflow registry or use default model"""
     global model, model_info
     
-    try:
-        import mlflow.sklearn
-        
-        mlflow_tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
-        if mlflow_tracking_uri:
-            mlflow.set_tracking_uri(mlflow_tracking_uri)
-            logger.info(f"MLflow tracking URI configured", 
-                       mlflow_uri=mlflow_tracking_uri)
-        
-        model_name = os.getenv("MODEL_NAME", "iris-classifier")
-        model_stage = os.getenv("MODEL_STAGE", "Production")
-        
-        logger.info(f"Attempting to load model from MLflow", 
-                   model_name=model_name, 
-                   stage=model_stage)
-        
+    tracer = get_tracer()
+    with tracer.start_as_current_span("load_model_from_mlflow") as span:
         try:
-            # Try with alias first (new way)
-            model_uri = f"models:/{model_name}@champion"
-            logger.info(f"Trying to load with alias", model_uri=model_uri)
-            model = mlflow.sklearn.load_model(model_uri)
-            model_info = {
-                "source": "mlflow_alias",
-                "model_name": model_name,
-                "alias": "champion"
-            }
-            logger.info(f"Model loaded from MLflow with alias 'champion'")
-            return True
-        except Exception as alias_error:
-            logger.warning(f"Could not load with alias: {str(alias_error)}")
+            import mlflow.sklearn
             
-            # Fallback to stage (old way)
+            mlflow_tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+            if mlflow_tracking_uri:
+                mlflow.set_tracking_uri(mlflow_tracking_uri)
+                logger.info(f"MLflow tracking URI configured", 
+                           mlflow_uri=mlflow_tracking_uri)
+            
+            model_name = os.getenv("MODEL_NAME", "iris-classifier")
+            model_stage = os.getenv("MODEL_STAGE", "Production")
+            
+            span.set_attribute("model.name", model_name)
+            span.set_attribute("model.stage", model_stage)
+            
+            logger.info(f"Attempting to load model from MLflow", 
+                       model_name=model_name, 
+                       stage=model_stage)
+            
             try:
-                model_uri = f"models:/{model_name}/{model_stage}"
-                logger.info(f"Trying to load with stage", model_uri=model_uri)
+                # Try with alias first (new way)
+                model_uri = f"models:/{model_name}@champion"
+                logger.info(f"Trying to load with alias", model_uri=model_uri)
                 model = mlflow.sklearn.load_model(model_uri)
                 model_info = {
-                    "source": "mlflow_stage",
+                    "source": "mlflow_alias",
                     "model_name": model_name,
-                    "stage": model_stage
+                    "alias": "champion"
                 }
-                logger.info(f"Model loaded from MLflow stage '{model_stage}'")
+                span.set_attribute("model.source", "mlflow_alias")
+                logger.info(f"Model loaded from MLflow with alias 'champion'")
                 return True
-            except Exception as stage_error:
-                logger.warning(f"Could not load from MLflow stage: {str(stage_error)}")
-                raise
-        
-    except Exception as e:
-        logger.warning(f"Could not load from MLflow: {str(e)}")
-        logger.info("Falling back to default model...")
-        return load_default_model()
+            except Exception as alias_error:
+                logger.warning(f"Could not load with alias: {str(alias_error)}")
+                
+                # Fallback to stage (old way)
+                try:
+                    model_uri = f"models:/{model_name}/{model_stage}"
+                    logger.info(f"Trying to load with stage", model_uri=model_uri)
+                    model = mlflow.sklearn.load_model(model_uri)
+                    model_info = {
+                        "source": "mlflow_stage",
+                        "model_name": model_name,
+                        "stage": model_stage
+                    }
+                    span.set_attribute("model.source", "mlflow_stage")
+                    logger.info(f"Model loaded from MLflow stage '{model_stage}'")
+                    return True
+                except Exception as stage_error:
+                    logger.warning(f"Could not load from MLflow stage: {str(stage_error)}")
+                    raise
+            
+        except Exception as e:
+            logger.warning(f"Could not load from MLflow: {str(e)}")
+            logger.info("Falling back to default model...")
+            return load_default_model()
 
 
 # Middleware to log request/response
@@ -254,8 +274,12 @@ async def log_requests(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup_event():
-    """Load model on application startup"""
+    """Load model and setup tracing on application startup"""
     logger.info("Starting IRIS Classification API...")
+    
+    # Setup tracing FIRST
+    setup_tracing(app)
+    
     logger.info(f"Environment configuration", 
                port=os.getenv("PORT", "8080"),
                model_name=os.getenv("MODEL_NAME", "iris-classifier"),
@@ -325,58 +349,75 @@ async def predict(features: IrisFeatures, request: Request):
         logger.error("Prediction failed: Model not loaded")
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    start_time = time.time()
-    request_id = request.headers.get("X-Request-ID", "unknown")
-    
-    try:
-        # Prepare input data
-        input_data = np.array([[
-            features.sepal_length,
-            features.sepal_width,
-            features.petal_length,
-            features.petal_width
-        ]])
+    tracer = get_tracer()
+    with tracer.start_as_current_span("predict") as span:
+        start_time = time.time()
+        request_id = request.headers.get("X-Request-ID", "unknown")
         
-        # Make prediction
-        prediction = model.predict(input_data)[0]
-        probabilities = model.predict_proba(input_data)[0]
+        # Add attributes to span
+        span.set_attribute("prediction.request_id", request_id)
+        span.set_attribute("prediction.sepal_length", features.sepal_length)
+        span.set_attribute("prediction.sepal_width", features.sepal_width)
         
-        # Map to class names
-        class_names = ["setosa", "versicolor", "virginica"]
-        predicted_class = class_names[prediction]
-        confidence = float(probabilities[prediction])
-        
-        prob_dict = {
-            class_names[i]: float(probabilities[i])
-            for i in range(len(class_names))
-        }
-        
-        latency_ms = round((time.time() - start_time) * 1000, 2)
-        
-        # Log successful prediction
-        logger.info(
-            "Prediction successful",
-            request_id=request_id,
-            prediction=predicted_class,
-            confidence=round(confidence, 3),
-            latency_ms=latency_ms
-        )
-        
-        return {
-            "prediction": predicted_class,
-            "confidence": confidence,
-            "probabilities": prob_dict,
-            "model_version": model_info.get("model_name", "default"),
-            "timestamp": datetime.utcnow().isoformat(),
-            "request_id": request_id
-        }
-        
-    except Exception as e:
-        logger.error(
-            f"Prediction error: {str(e)}",
-            request_id=request_id
-        )
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+        try:
+            # Prepare input data
+            with tracer.start_as_current_span("prepare_input"):
+                input_data = np.array([[
+                    features.sepal_length,
+                    features.sepal_width,
+                    features.petal_length,
+                    features.petal_width
+                ]])
+            
+            # Make prediction
+            with tracer.start_as_current_span("model_inference"):
+                prediction = model.predict(input_data)[0]
+                probabilities = model.predict_proba(input_data)[0]
+            
+            # Map to class names
+            with tracer.start_as_current_span("format_response"):
+                class_names = ["setosa", "versicolor", "virginica"]
+                predicted_class = class_names[prediction]
+                confidence = float(probabilities[prediction])
+                
+                prob_dict = {
+                    class_names[i]: float(probabilities[i])
+                    for i in range(len(class_names))
+                }
+            
+            latency_ms = round((time.time() - start_time) * 1000, 2)
+            
+            # Add prediction result to span
+            span.set_attribute("prediction.result", predicted_class)
+            span.set_attribute("prediction.confidence", confidence)
+            span.set_attribute("prediction.latency_ms", latency_ms)
+            
+            # Log successful prediction
+            logger.info(
+                "Prediction successful",
+                request_id=request_id,
+                prediction=predicted_class,
+                confidence=round(confidence, 3),
+                latency_ms=latency_ms
+            )
+            
+            return {
+                "prediction": predicted_class,
+                "confidence": confidence,
+                "probabilities": prob_dict,
+                "model_version": model_info.get("model_name", "default"),
+                "timestamp": datetime.utcnow().isoformat(),
+                "request_id": request_id
+            }
+            
+        except Exception as e:
+            span.set_attribute("error", True)
+            span.set_attribute("error.message", str(e))
+            logger.error(
+                f"Prediction error: {str(e)}",
+                request_id=request_id
+            )
+            raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 
 @app.post("/batch-predict", tags=["Prediction"])
@@ -396,60 +437,70 @@ async def batch_predict(features_list: List[IrisFeatures], request: Request):
     if len(features_list) > 100:
         raise HTTPException(status_code=400, detail="Batch size limited to 100 samples")
     
-    start_time = time.time()
-    request_id = request.headers.get("X-Request-ID", "unknown")
-    
-    try:
-        results = []
+    tracer = get_tracer()
+    with tracer.start_as_current_span("batch_predict") as span:
+        start_time = time.time()
+        request_id = request.headers.get("X-Request-ID", "unknown")
         
-        for features in features_list:
-            input_data = np.array([[
-                features.sepal_length,
-                features.sepal_width,
-                features.petal_length,
-                features.petal_width
-            ]])
+        span.set_attribute("batch.size", len(features_list))
+        span.set_attribute("batch.request_id", request_id)
+        
+        try:
+            results = []
             
-            prediction = model.predict(input_data)[0]
-            probabilities = model.predict_proba(input_data)[0]
+            for idx, features in enumerate(features_list):
+                with tracer.start_as_current_span(f"predict_item_{idx}"):
+                    input_data = np.array([[
+                        features.sepal_length,
+                        features.sepal_width,
+                        features.petal_length,
+                        features.petal_width
+                    ]])
+                    
+                    prediction = model.predict(input_data)[0]
+                    probabilities = model.predict_proba(input_data)[0]
+                    
+                    class_names = ["setosa", "versicolor", "virginica"]
+                    predicted_class = class_names[prediction]
+                    confidence = float(probabilities[prediction])
+                    
+                    prob_dict = {
+                        class_names[i]: float(probabilities[i])
+                        for i in range(len(class_names))
+                    }
+                    
+                    results.append({
+                        "prediction": predicted_class,
+                        "confidence": confidence,
+                        "probabilities": prob_dict
+                    })
             
-            class_names = ["setosa", "versicolor", "virginica"]
-            predicted_class = class_names[prediction]
-            confidence = float(probabilities[prediction])
+            latency_ms = round((time.time() - start_time) * 1000, 2)
             
-            prob_dict = {
-                class_names[i]: float(probabilities[i])
-                for i in range(len(class_names))
+            span.set_attribute("batch.latency_ms", latency_ms)
+            
+            logger.info(
+                f"Batch prediction completed",
+                request_id=request_id,
+                batch_size=len(results),
+                latency_ms=latency_ms
+            )
+            
+            return {
+                "predictions": results,
+                "count": len(results),
+                "model_version": model_info.get("model_name", "default"),
+                "timestamp": datetime.utcnow().isoformat()
             }
             
-            results.append({
-                "prediction": predicted_class,
-                "confidence": confidence,
-                "probabilities": prob_dict
-            })
-        
-        latency_ms = round((time.time() - start_time) * 1000, 2)
-        
-        logger.info(
-            f"Batch prediction completed",
-            request_id=request_id,
-            batch_size=len(results),
-            latency_ms=latency_ms
-        )
-        
-        return {
-            "predictions": results,
-            "count": len(results),
-            "model_version": model_info.get("model_name", "default"),
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(
-            f"Batch prediction error: {str(e)}",
-            request_id=request_id
-        )
-        raise HTTPException(status_code=500, detail=f"Batch prediction failed: {str(e)}")
+        except Exception as e:
+            span.set_attribute("error", True)
+            span.set_attribute("error.message", str(e))
+            logger.error(
+                f"Batch prediction error: {str(e)}",
+                request_id=request_id
+            )
+            raise HTTPException(status_code=500, detail=f"Batch prediction failed: {str(e)}")
 
 
 @app.get("/metrics", tags=["Monitoring"])
