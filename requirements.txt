@@ -36,3 +36,9 @@ httpx # For testing FastAPI endpoints
 # Additional utilities
 python-dotenv # For environment variable management
 pyyaml # For YAML configuration files
+
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-exporter-gcp-trace
+opentelemetry-instrumentation-requests

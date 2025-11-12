@@ -1,11 +1,9 @@
 name: CI/CD - Production Pipeline
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:  # Allow manual triggers
+  workflow_dispatch: 
 
 permissions:
   contents: write
@@ -82,13 +80,13 @@ jobs:
         if python main.py \
           --data-path iris-dvc-pipeline/v1_data.csv \
           --use-mlflow-model \
-          --model-stage Staging \
-          --mlflow-tracking-uri "${MLFLOW_TRACKING_URI:-file:./mlruns}" \
+          --model-alias stg \
+          --mlflow-tracking-uri ${{ secrets.MLFLOW_TRACKING_URI }} \
           --metrics-path iris-dvc-pipeline/metrics.txt 2>/dev/null; then
           echo "✓ Loaded model from MLflow Staging stage"
           echo "model_source=mlflow_staging" >> $GITHUB_OUTPUT
         else
-          echo "❌ No model found in Staging! Cannot proceed to production."
+          echo "⚠️ No model found in Staging! Cannot proceed to production."
           echo "Please ensure a model is promoted to Staging before merging to main."
           exit 1
         fi
@@ -111,10 +109,10 @@ jobs:
             echo "✅ Model meets production threshold"
           else
             echo "should_deploy=false" >> $GITHUB_OUTPUT
-            echo "⚠️  Model does not meet production threshold"
+            echo "⚠️ Model does not meet production threshold"
           fi
         else
-          echo "❌ Metrics file not found"
+          echo "⚠️ Metrics file not found"
           exit 1
         fi
     
@@ -129,13 +127,23 @@ jobs:
         
         if (( $(echo "$ACCURACY >= $THRESHOLD" | bc -l) )); then
           echo "✅ Model meets PRODUCTION threshold ($ACCURACY >= $THRESHOLD)"
+
+          # --- THIS IS THE NEW PART ---
+          echo "🚀 Promoting model from @dev to @stg..."
+          python main.py \
+            --promote-model-alias \
+            --model-name "iris-classifier" \
+            --from-alias "stg" \
+            --to-alias "prod" \
+            --mlflow-tracking-uri ${{ secrets.MLFLOW_TRACKING_URI }}
+          
+          echo "promotion_status=promoted" >> $GITHUB_OUTPUT
+
         else
-          echo "❌ Model does not meet PRODUCTION threshold ($ACCURACY < $THRESHOLD)"
-          echo "⚠️  Production requires higher standards than dev (${THRESHOLD} vs 0.85)"
+          echo "⚠️ Model does not meet PRODUCTION threshold ($ACCURACY < $THRESHOLD)"
+          echo "⚠️ Production requires higher standards than dev (${THRESHOLD} vs 0.85)"
           exit 1
         fi
-
-    
     
     - name: Run data validation checks
       run: |
@@ -189,7 +197,7 @@ jobs:
         fi
         echo "" >> report.md
         
-        echo "### 🔄 Production Pipeline Flow" >> report.md
+        echo "### 📄 Production Pipeline Flow" >> report.md
         echo "1. ✅ Code checkout and environment setup" >> report.md
         echo "2. ✅ Production data pulled from DVC" >> report.md
         echo "3. ✅ Unit tests executed" >> report.md
@@ -220,13 +228,3 @@ jobs:
         REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         cml comment create report.md
-
-    - name: Promote validated model to Production
-      if: ${{ steps.evaluate.outputs.should_deploy == 'true' }}
-      run: |
-        echo "🚀 Promoting model to Production in MLflow..."
-        python main.py \
-          --mlflow-tracking-uri "${MLFLOW_TRACKING_URI:-file:./mlruns}" \
-          --mlflow-experiment-name iris-classification \
-          --promote-to-production
-        echo "✅ Model successfully promoted to Production stage!"

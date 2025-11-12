@@ -13,6 +13,7 @@ from src.model_training import ModelTrainer
 from src.dvc_operations import DVCOperations
 
 from mlflow.models import infer_signature
+import mlflow
 
 import pandas as pd
 
@@ -51,6 +52,8 @@ def main():
     # Training arguments
     parser.add_argument('--hyperparameter-tuning', action='store_true',
                        help='Enable hyperparameter tuning with GridSearchCV')
+    parser.add_argument('--singleparameter-tuning', action='store_true',
+                       help='Simple training without tuning')
     parser.add_argument('--max-depth', type=int, default=3,
                        help='Maximum depth for decision tree (if not tuning)')
     parser.add_argument('--cv-folds', type=int, default=5,
@@ -59,13 +62,21 @@ def main():
     # Model registry arguments
     parser.add_argument('--use-mlflow-model', action='store_true',
                        help='Load model from MLflow registry instead of training')
-    parser.add_argument('--model-stage', type=str, default='Production',
-                       choices=['Production', 'Staging', 'None'],
-                       help='Model stage to load from MLflow registry')
+    parser.add_argument('--model-alias', type=str, default='production',
+                       help='Model alias to load from MLflow registry')
     parser.add_argument('--model-version', type=int, default=None,
                        help='Specific model version to load from MLflow registry')
     parser.add_argument('--promote-to-production', action='store_true',
                        help='Promote the trained model to Production stage')
+    
+    parser.add_argument('--from-alias', type=str,
+                       help='Alias to promote from (e.g., dev)')
+    parser.add_argument('--to-alias', type=str,
+                       help='Alias to promote to (e.g., stg)')
+    parser.add_argument('--model-name', type=str,
+                       help='Name of the registered model')
+    parser.add_argument('--promote-model-alias', action='store_true',
+                       help='Promote model alias in MLflow Model Registry')
     
     # Comparison mode
     parser.add_argument('--run-comparison', action='store_true',
@@ -119,21 +130,13 @@ def main():
         logger.info("Splitting data into train and test sets...")
         X_train, X_test, y_train, y_test = data_processor.split_data(data)
         
-        # Handle comparison mode - run multiple experiments
-        if args.run_comparison:
-            logger.info("Running comparison mode with multiple hyperparameter configurations...")
-            run_comparison_experiments(model_trainer, X_train, y_train, X_test, y_test)
-            logger.info("Comparison experiments completed! Check MLflow UI for visualization.")
-            return 0
-        
         # Load model from MLflow registry or train new model
         if args.use_mlflow_model:
             logger.info("Loading model from MLflow registry...")
             try:
-                model = model_trainer.load_model_from_mlflow(
+                model_trainer.load_model_from_mlflow(
                     model_name="iris-classifier",
-                    stage=args.model_stage,
-                    version=args.model_version
+                    alias = args.model_alias
                 )
                 logger.info("Model loaded successfully from MLflow")
                 
@@ -143,143 +146,73 @@ def main():
                 
             except Exception as e:
                 logger.error(f"Failed to load model from MLflow: {e}")
-                logger.info("Falling back to training a new model...")
-                args.use_mlflow_model = False
         
-        # Train new model if not loaded from registry
-        if not args.use_mlflow_model:
-            if args.hyperparameter_tuning:
-                logger.info("Training model with hyperparameter tuning...")
-                model = model_trainer.train_with_hyperparameter_tuning(
-                    X_train, y_train, cv=args.cv_folds
+        if args.promote_model_alias:
+
+            try:
+                model_trainer.promote_model_alias(
+                model_name=args.model_name,
+                from_alias=args.from_alias,
+                to_alias=args.to_alias
                 )
-            else:
-                logger.info("Training model with single hyperparameter set...")
-                model = model_trainer.train_model(X_train, y_train)
+
+                logger.info(f"Model promoted successfully from {args.from_alias} to {args.to_alias}")
+            except Exception as e:
+                logger.error(f"Failed to promote model alias: {e}")
+        
+        if args.hyperparameter_tuning or args.singleparameter_tuning:
             
-            # Evaluate model
-            logger.info("Evaluating model...")
-            metrics = model_trainer.evaluate_model(X_test, y_test, log_to_mlflow=True)
+            logger.info("Starting a new MLflow run for training and evaluation...")
             
-            # Promote to production if requested
-            if args.promote_to_production:
-                logger.info("Promoting model to Production stage...")
-                best_run_id = model_trainer.get_best_model_from_experiment(
-                    experiment_name=args.mlflow_experiment_name,
-                    metric="test_accuracy"
-                )
-                model_trainer.promote_model_to_production(
-                    model_name="iris-classifier",
-                    run_id=best_run_id
-                )
-        
-        # Save metrics to file
-        logger.info("Saving metrics...")
-        model_trainer.save_metrics(metrics, args.metrics_path)
-        
-        logger.info("Pipeline completed successfully!")
-        logger.info(f"Model accuracy: {metrics['accuracy']:.4f}")
-        logger.info(f"Model F1 score: {metrics['f1_score']:.4f}")
+            # Start the single run that covers BOTH training and evaluation
+            with mlflow.start_run(run_name="iris_training_run") as run:
+                
+                run_id = run.info.run_id
+                model_trainer.current_run_id = run_id
+                logger.info(f"MLflow run started: {run_id}")
+                
+                # Log all the script arguments for reproducibility
+                mlflow.log_params(vars(args))
+
+                # --- Run Training ---
+                if args.hyperparameter_tuning:
+                    logger.info("Training model with hyperparameter tuning...")
+                    model_trainer.train_with_hyperparameter_tuning(
+                        X_train, y_train, cv=args.cv_folds
+                    )
+                elif args.singleparameter_tuning:
+                    logger.info("Training model with single hyperparameter set...")
+                    model_trainer.train_model(X_train, y_train) # Will log to active run
+                
+                # Store the run_id
+                training_run_id = model_trainer.current_run_id
+                logger.info(f"Model trained and logged in run: {training_run_id}")
+                
+                # --- Run Evaluation ---
+                # This will now find the active run and log metrics to it
+                logger.info("Evaluating model...")
+                metrics = model_trainer.evaluate_model(X_test, y_test, log_to_mlflow=True)
+                
+                # Save metrics to file
+                logger.info("Saving metrics...")
+                model_trainer.save_metrics(metrics, args.metrics_path)
+                
+                logger.info("Pipeline completed successfully!")
+                logger.info(f"Model accuracy: {metrics['accuracy']:.4f}")
+                logger.info(f"Model F1 score: {metrics['f1_score']:.4f}")
+
+            # The 'with' block is over, the run is now closed.
+            logger.info(f"MLflow run {run_id} finished.")
         
         return 0
         
     except Exception as e:
         logger.error(f"Pipeline failed with error: {e}")
+        # If the error happened inside the 'with' block, MLflow automatically
+        # sets the run status to "FAILED", which is good.
         import traceback
         traceback.print_exc()
         return 1
-
-
-def run_comparison_experiments(model_trainer, X_train, y_train, X_test, y_test):
-    """
-    Run multiple experiments with different configurations for comparison.
-    
-    Args:
-        model_trainer: ModelTrainer instance
-        X_train: Training features
-        y_train: Training labels
-        X_test: Test features
-        y_test: Test labels
-    """
-    import mlflow
-    
-    # Experiment 1: Shallow tree
-    logger.info("Experiment 1: Shallow tree (max_depth=2)")
-    with mlflow.start_run(run_name="shallow_tree_exp"):
-        model_trainer.max_depth = 2
-        model_trainer.train_model(X_train, y_train, log_to_mlflow=False)
-        
-        mlflow.log_param("max_depth", 2)
-        mlflow.log_param("experiment_type", "shallow_tree")
-        
-        metrics = model_trainer.evaluate_model(X_test, y_test, log_to_mlflow=True)
-        
-        
-        input_example = X_train.iloc[:5] if isinstance(X_train, pd.DataFrame) else None
-        signature = infer_signature(X_train, y_train)
-
-        mlflow.sklearn.log_model(
-            sk_model=model_trainer.model,
-            name="model",
-            registered_model_name="iris-classifier",
-            input_example=input_example,
-            signature=signature
-        )
-    
-    # Experiment 2: Medium tree
-    logger.info("Experiment 2: Medium tree (max_depth=4)")
-    with mlflow.start_run(run_name="medium_tree_exp"):
-        model_trainer.max_depth = 4
-        model_trainer.train_model(X_train, y_train, log_to_mlflow=False)
-        
-        mlflow.log_param("max_depth", 4)
-        mlflow.log_param("experiment_type", "medium_tree")
-        
-        metrics = model_trainer.evaluate_model(X_test, y_test, log_to_mlflow=True)
-
-        input_example = X_train.iloc[:5] if isinstance(X_train, pd.DataFrame) else None
-        signature = infer_signature(X_train, y_train)
-        
-        mlflow.sklearn.log_model(
-            sk_model=model_trainer.model,
-            name="model",
-            registered_model_name="iris-classifier",
-            input_example=input_example,
-            signature=signature
-        )
-    
-    # Experiment 3: Deep tree
-    logger.info("Experiment 3: Deep tree (max_depth=8)")
-    with mlflow.start_run(run_name="deep_tree_exp"):
-        model_trainer.max_depth = 8
-        model_trainer.train_model(X_train, y_train, log_to_mlflow=False)
-        
-        mlflow.log_param("max_depth", 8)
-        mlflow.log_param("experiment_type", "deep_tree")
-        
-        metrics = model_trainer.evaluate_model(X_test, y_test, log_to_mlflow=True)
-
-        input_example = X_train.iloc[:5] if isinstance(X_train, pd.DataFrame) else None
-        signature = infer_signature(X_train, y_train)
-        
-        mlflow.sklearn.log_model(
-            sk_model=model_trainer.model,
-            name="model",
-            registered_model_name="iris-classifier",
-            input_example=input_example,
-            signature=signature
-        )
-    
-    # Experiment 4: Hyperparameter tuning
-    logger.info("Experiment 4: Hyperparameter tuning with GridSearchCV")
-    param_grid = {
-        'max_depth': [3, 4, 5],
-        'min_samples_split': [2, 5],
-        'criterion': ['gini', 'entropy']
-    }
-    model_trainer.train_with_hyperparameter_tuning(X_train, y_train, param_grid=param_grid)
-    metrics = model_trainer.evaluate_model(X_test, y_test, log_to_mlflow=True)
-
 
 if __name__ == "__main__":
     exit(main())

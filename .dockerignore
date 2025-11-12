@@ -25,7 +25,6 @@ coverage.xml
 *.cover
 
 # MLflow (don't include in image, will be loaded at runtime)
-mlruns/
 mlartifacts/
 
 # DVC

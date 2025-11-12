@@ -24,13 +24,6 @@ env/
 *.code-workspace
 
 # ---------------------------
-# MLflow
-# ---------------------------
-mlruns/
-mlartifacts/
-mlflow.db
-
-# ---------------------------
 # DVC
 # ---------------------------
 .cache/
@@ -48,7 +41,6 @@ tmp/
 # ---------------------------
 data/
 datasets/
-models/
 *.joblib
 *.pkl
 *.h5
