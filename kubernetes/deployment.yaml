@@ -21,6 +21,7 @@ spec:
         app: iris-api
         version: v1
     spec:
+      serviceAccountName: telemetry-access
       containers:
       - name: iris-api
         image: REGION-docker.pkg.dev/PROJECT_ID/iris-api/iris-classifier:TAG  # Will be replaced by CI/CD
@@ -38,7 +39,7 @@ spec:
         - name: PYTHONUNBUFFERED
           value: "1"
         - name: GCP_PROJECT_ID
-          value: verdant-victory-473118-k0
+          value: "verdant-victory-473118-k0"
         resources:
           requests:
             memory: "256Mi"
